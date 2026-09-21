@@ -77,6 +77,7 @@ API Key 只放后端，不能填入前端代码或提交仓库。不把密钥发
 
 ## 项目记录
 
+- [组队提案书](docs/PROPOSAL.md)
 - [文档中心与维护规则](docs/README.md)
 - [产品需求文档（PRD）](docs/PRD.md)
 - [架构与云端部署边界](docs/ARCHITECTURE.md)
