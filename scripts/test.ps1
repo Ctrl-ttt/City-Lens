@@ -11,6 +11,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
     if ($Browser) {
         & pnpm --dir frontend test:e2e
-        if ($LASTEXITCODE -ne 0) { throw 'Browser tests failed. Stop the existing port 8000 server before retrying.' }
+        if ($LASTEXITCODE -ne 0) { throw 'Browser tests failed. Check the Playwright output for a missing browser, port 8000 conflict, or failed assertion.' }
     }
 } finally { Pop-Location }

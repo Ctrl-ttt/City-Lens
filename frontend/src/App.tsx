@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
+import { Accessibility, ALargeSmall, Camera, Contrast, FileVideo, Headphones, Info, Pause, Play, RotateCcw, ScanText, Square, Volume2, VolumeX } from 'lucide-react';
 import type { Analysis, Health, Mode, Source } from './types';
 import { SessionGate } from './session';
 import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from './speech';
+import cityLensMark from './assets/citylens-mark.svg';
+import './brand.css';
 
 const sourceNames = { camera: '实时摄像头', video: '路线视频回放' };
 const directionNames = { left: '左前方', front: '前方', right: '右前方', unknown: '画面中' };
@@ -37,6 +40,8 @@ export default function App() {
   const [history, setHistory] = useState<Analysis[]>([]);
   const [roundtrip, setRoundtrip] = useState(0);
   const [singleOnly, setSingleOnly] = useState(false);
+  const [largeText, setLargeText] = useState(false);
+  const [highContrast, setHighContrast] = useState(false);
 
   if (!queue.current) queue.current = new SpeechQueue(browserVoiceDriver(() => setVoiceError('语音播放失败，请检查系统中文语音和输出设备。')), () => gate.current.session);
 
@@ -212,36 +217,56 @@ export default function App() {
   }
   const permitted = consent && !!health?.configured && !connecting;
 
-  return <div className="shell">
+  return <div className={`shell ${largeText ? 'large-text' : ''} ${highContrast ? 'high-contrast' : ''}`}>
     <a className="skip" href="#controls">跳转到操作区</a>
-    <header className="header"><a className="brand" href="#"><span className="lens-mark" aria-hidden="true">◉</span><span>CityLens<small>看见城市，听见线索</small></span></a><div className="header-meta"><span className="tag">AI + 社会公益</span><span className="version">原型 v0.1</span></div></header>
+    <header className="header">
+      <a className="brand" href="#"><span className="lens-mark" aria-hidden="true"><img src={cityLensMark} alt=""/></span><span><strong>CityLens</strong><small>城市环境理解助手</small></span></a>
+      <div className="header-tools" aria-label="显示设置">
+        <span className={`system-state ${health?.configured ? 'ready' : ''}`}><span aria-hidden="true"/>{health?.configured ? '服务已就绪' : '服务未就绪'}</span>
+        <button className="display-toggle" aria-pressed={largeText} onClick={() => setLargeText(value => !value)}><ALargeSmall aria-hidden="true"/>大字</button>
+        <button className="display-toggle" aria-pressed={highContrast} onClick={() => setHighContrast(value => !value)}><Contrast aria-hidden="true"/>高对比</button>
+      </div>
+    </header>
     <main>
-      <section className="intro"><div><p className="eyebrow">YOUR CITY, A LITTLE CLEARER</p><h1>让重要的信息，<br/><span>被听见。</span></h1><p className="intro-copy">面向视障与低视力人群的城市环境理解原型。<br/>观察当前画面，听取简短提示，按需读取标牌。</p></div><div className="intro-note"><span className="note-number">01 / OBSERVE</span><p>先观察，再理解。</p><small>提示方向以相机画面为准<br/>不提供测距或通行决策</small></div></section>
+      <section className={`now-panel ${error ? 'has-error' : ''}`} aria-labelledby="current-notice">
+        <div className="now-heading">
+          <span className="mode-label"><Accessibility aria-hidden="true"/>{mode === 'walk' ? '环境提示' : '看牌模式'}</span>
+          <span className="activity-label">{connecting ? '正在连接输入' : busy ? '正在识别' : running ? '自动观察中' : '等待操作'}</span>
+        </div>
+        <p className="now-kicker" id="current-notice">当前提示</p>
+        <h1 className="live-caption" role="status" aria-live={muted || !voiceName ? 'polite' : 'off'}>{notice}</h1>
+        {error && <p className="error" role="alert">{error}</p>}
+        <div className="now-actions" aria-label="播报操作">
+          <button disabled={!last.current || muted || !voiceName} onClick={replay}><RotateCcw aria-hidden="true"/>重播上一条</button>
+          <button aria-pressed={muted} onClick={toggleMute}>{muted ? <Volume2 aria-hidden="true"/> : <VolumeX aria-hidden="true"/>}{muted ? '取消静音' : '静音'}</button>
+        </div>
+      </section>
       {health?.provider === 'sample' && <div className="banner sample" role="status"><strong>样例联调模式 · 不是实际识别</strong><span>结果来自固定样例，不分析输入画面；不会发送至云端。场景：{health.sample_scene}</span></div>}
       {(healthError || (health && !health.configured)) && <div className="banner warning"><span>{healthError || '模型尚未配置。请在后端 .env 配置 API，再重新检查。'}</span><button onClick={() => void checkHealth()}>重新检查</button></div>}
+      <section className="control-card" id="controls" aria-labelledby="control-title">
+        <div className="control-top"><div><p className="section-index">操作</p><h2 id="control-title">开始了解周围环境</h2></div><label className="switch-label"><input type="checkbox" checked={singleOnly} onChange={e => { invalidate('识别方式已切换'); setSingleOnly(e.target.checked); }}/><span>只用按键识别</span></label></div>
+        <fieldset className="source-field"><legend>输入来源</legend><div className="source-tabs"><button aria-pressed={source==='camera'} onClick={() => changeSource('camera')}><Camera aria-hidden="true"/>实时摄像头</button><button aria-pressed={source==='video'} onClick={() => changeSource('video')}><FileVideo aria-hidden="true"/>路线视频回放</button></div></fieldset>
+        <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
+        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : mode==='read' ? <><Play aria-hidden="true"/>▶ 返回环境识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!permitted || busy} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
+      </section>
       <div className="workspace">
         <section className="camera-card" aria-label="画面输入">
-          <div className="card-heading"><h2>观察窗口</h2><span className={`status ${running ? 'on' : ''}`}><i/>{connecting ? '连接中' : busy ? '识别中' : running ? '自动观察中' : '待命'}</span></div>
-          <div className="source-tabs" role="group" aria-label="输入来源"><button aria-pressed={source==='camera'} onClick={() => changeSource('camera')}>实时摄像头</button><button aria-pressed={source==='video'} onClick={() => changeSource('video')}>路线视频回放</button></div>
+          <div className="card-heading"><div><p className="section-index">画面</p><h2>观察窗口</h2></div><span className={`status ${running ? 'on' : ''}`}><i/>{connecting ? '连接中' : busy ? '识别中' : running ? '自动观察中' : '待命'}</span></div>
           <div className={`viewport ${ready ? 'has-video' : ''}`}>
             <video ref={video} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
-            {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true"><span>◎</span></div><h3>{source==='camera' ? '准备好，看看周围' : '从一段路线开始'}</h3><p>{source==='camera' ? '点击开始后，允许浏览器使用摄像头' : '选择本地 MP4，使用同一条 AI 识别链路'}</p></div>}
+            {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true">{source === 'camera' ? <Camera/> : <FileVideo/>}</div><h3>{source==='camera' ? '摄像头尚未开启' : '尚未选择路线视频'}</h3><p>{source==='camera' ? '同意处理后点击开始识别' : '选择本地 MP4 后开始识别'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
           <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><small>支持 Link 2 / USB 摄像头 · 画面不镜像</small></>}</div>
         </section>
-        <section className="insight-card" aria-label="环境提示"><div className="card-heading"><h2>此刻的重点</h2><span className="tag subtle">{mode==='walk' ? '环境提示' : '看牌模式'}</span></div>
-          <div className="insight-main"><span className="sound-symbol" aria-hidden="true">◖ )))</span><p className="live-caption" role="status" aria-live={muted || !voiceName ? 'polite' : 'off'}>{notice}</p>{error && <p className="error" role="alert">{error}</p>}</div>
+        <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 3 项</span></div>
           <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{directionNames[event.direction]}</span></div>)}</div>
+          {!result?.events.length && <div className="empty-events"><Info aria-hidden="true"/><p>识别后，这里会列出当前画面中可确认的信息。</p></div>}
           <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : '千问视觉模型'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
           <p className="quiet-note">只提示当前画面中可确认的信息。没有提示，不代表前方安全。</p>
         </section>
       </div>
-      <section className="control-card" id="controls" aria-label="识别操作"><div className="control-top"><div><h2>按你的节奏，了解环境</h2><p>环境提示自动观察；看牌由你主动触发。</p></div><label className="switch-label"><input type="checkbox" checked={singleOnly} onChange={e => { invalidate('识别方式已切换'); setSingleOnly(e.target.checked); }}/>只用按键识别</label></div>
-        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? '连接摄像头中…' : running ? 'Ⅱ 暂停识别' : mode==='read' ? '▶ 返回环境识别' : singleOnly ? '识别当前环境' : '▶ 开始识别'}</button><button disabled={!permitted || busy} onClick={() => void start(true)}>看牌 · 读取文字</button><button disabled={!last.current || muted || !voiceName} onClick={replay}>重播上一条</button><button aria-pressed={muted} onClick={toggleMute}>{muted ? '取消静音' : '静音'}</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}>停止并释放输入</button></div>
-        <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
-      </section>
-      <section className="bottom-grid"><div className="voice-card"><h2>先听一下</h2><p>{voiceName || '尚未检测到中文语音。请安装系统中文语音后重启浏览器。'}</p>{voiceError && <p role="alert" className="error">{voiceError}</p>}<button onClick={voiceTest} disabled={muted || running || busy}>测试中文语音</button></div><details className="debug"><summary>运行详情 <span>最近 5 次 · 仅本次会话</span></summary><p>服务：{health?.provider ?? '未连接'} · 模型：{health?.model ?? '—'}</p>{history.length===0 ? <p>尚无识别记录。</p> : history.map(r => <div className="debug-row" key={r.frame_id}>#{r.frame_id} · {r.status} · {r.latency_ms} ms · {r.events.length} 个观察</div>)}<p>不记录图片、密钥或 OCR 全文。</p></details></section>
-    </main><footer><span>CityLens / 城市环境理解助手</span><span>辅助理解原型 · 不替代专业无障碍设备</span></footer>
+      <section className="bottom-grid"><div className="voice-card"><div className="utility-icon" aria-hidden="true"><Headphones/></div><div><h2>语音输出</h2><p>{voiceName || '尚未检测到中文语音。请安装系统中文语音后重启浏览器。'}</p>{voiceError && <p role="alert" className="error">{voiceError}</p>}</div><button onClick={voiceTest} disabled={muted || running || busy}><Volume2 aria-hidden="true"/>测试中文语音</button></div><details className="debug"><summary>运行详情 <span>最近 5 次 · 仅本次会话</span></summary><p>服务：{health?.provider ?? '未连接'} · 模型：{health?.model ?? '—'}</p>{history.length===0 ? <p>尚无识别记录。</p> : history.map(r => <div className="debug-row" key={r.frame_id}>#{r.frame_id} · {r.status} · {r.latency_ms} ms · {r.events.length} 个观察</div>)}<p>不记录图片、密钥或 OCR 全文。</p></details></section>
+    </main><footer><span>CityLens · 环境理解辅助工具</span><span>不提供测距、通行判断或安全保证</span></footer>
   </div>;
 }

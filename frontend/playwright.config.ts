@@ -1,9 +1,16 @@
 import { defineConfig } from '@playwright/test';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const python = path.join(root, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+const edgeInstalled = process.platform === 'win32' && [
+  path.join(process.env.PROGRAMFILES ?? '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  path.join(process.env['PROGRAMFILES(X86)'] ?? '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+].some(existsSync);
+const browserChannel = process.env.PLAYWRIGHT_CHANNEL || (edgeInstalled ? 'msedge' : 'chrome');
 
 export default defineConfig({
   testDir: './e2e',
@@ -12,7 +19,7 @@ export default defineConfig({
   timeout: 30000,
   use: {
     baseURL: 'http://localhost:8000',
-    channel: 'chrome',
+    channel: browserChannel,
     headless: true,
     viewport: { width: 1440, height: 1050 },
     launchOptions: { args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] },

@@ -1,7 +1,28 @@
 {
-  "name": "citylens", "private": true, "version": "0.1.0", "type": "module",
+  "name": "citylens",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
   "packageManager": "pnpm@11.19.0",
-  "scripts": { "dev": "vite --host localhost", "build": "tsc -b && vite build", "test": "vitest run", "test:e2e": "playwright test" },
-  "dependencies": { "react": "^19.1.1", "react-dom": "^19.1.1" },
-  "devDependencies": { "@types/react": "^19.1.10", "@types/react-dom": "^19.1.9", "@types/node": "^24.0.0", "@vitejs/plugin-react": "^5.0.0", "typescript": "~5.9.2", "vite": "^7.1.0", "vitest": "^3.2.4", "@playwright/test": "^1.55.0" }
+  "scripts": {
+    "dev": "vite --host localhost",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "lucide-react": "0.468.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.9.2",
+    "vite": "^7.1.0",
+    "vitest": "^3.2.4"
+  }
 }

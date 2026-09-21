@@ -6,7 +6,7 @@ React + TypeScript + FastAPI 原型：摄像头或本地 MP4 抽帧 → 千问�
 
 ## Windows 快速启动
 
-环境：Node.js 24、pnpm 11.19.0、Python 3.13 或 3.14、Google Chrome。当前机器实测 Python 3.14.6；3.13 尚待另一台电脑验证。
+环境：Node.js 24、pnpm 11.19.0、Python 3.13 或 3.14、Microsoft Edge 或 Google Chrome。当前机器实测 Python 3.14.6；3.13 尚待另一台电脑验证。
 
 在仓库根目录的 PowerShell 执行：
 
@@ -69,7 +69,7 @@ API Key 只放后端，不能填入前端代码或提交仓库。不把密钥发
 .\scripts\test.ps1 -Browser
 ```
 
-后端 pytest 使用模拟模型传输，前端 Vitest 覆盖会话与语音队列。Playwright 启动独立无头 Chrome、模拟摄像头和真实本地样例 API，生成合成 MP4 作为测试输入。测试不调用付费模型，不访问个人 Chrome 配置。运行 `pnpm --dir frontend test:e2e` 前需先构建前端。
+后端 pytest 使用模拟模型传输，前端 Vitest 覆盖会话与语音队列。Playwright 在 Windows 上优先使用已安装的 Edge，否则使用 Chrome；也可通过 `PLAYWRIGHT_CHANNEL` 覆盖。测试使用独立无头浏览器、模拟摄像头和真实本地样例 API，并生成合成 MP4 作为测试输入。测试不调用付费模型，不访问个人浏览器配置。运行 `pnpm --dir frontend test:e2e` 前需先构建前端。
 
 开发前端可另开终端运行 `pnpm --dir frontend dev`，访问 http://localhost:5173，`/api` 代理到 8000。后端仍使用 `.venv` 启动。
 
