@@ -5,6 +5,7 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+*.tsbuildinfo
 node_modules/
 frontend/dist/
 frontend/test-results/

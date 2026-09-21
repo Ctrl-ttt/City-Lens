@@ -13,7 +13,7 @@ export default function App() {
   const gate = useRef(new SessionGate());
   const active = useRef(false);
   const sourceRef = useRef<Source>('camera');
-  const modeRef = useRef<Mode>('walk');
+  const internalSeek = useRef(false);
   const queue = useRef<SpeechQueue | null>(null);
   const last = useRef<Candidate | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -73,6 +73,8 @@ export default function App() {
     if (sourceRef.current === 'video') video.current?.pause();
   }
   function failure(message: string) {
+    queue.current?.clear(); last.current = null; setResult(null); setRoundtrip(0);
+    setNotice('本次识别不可用，请重新观察当前画面');
     if (gate.current.failed()) { invalidate('已暂停自动识别'); setError(`${message} 连续三次失败，请检查后重新开始。`); }
     else setError(message);
   }
@@ -118,13 +120,26 @@ export default function App() {
     if (!consent || !health?.configured || connecting) return;
     invalidate(); setError('');
     const requestedMode: Mode = readMode ? 'read' : 'walk';
-    modeRef.current = requestedMode; setMode(requestedMode);
+    setMode(requestedMode);
     const session = gate.current.session;
     if (sourceRef.current === 'camera' && !(await prepareCamera())) return;
     if (session !== gate.current.session) return;
     if (!video.current || video.current.readyState < 2) { setError('请先连接摄像头或选择可播放的 MP4 视频。'); return; }
     if (sourceRef.current === 'video') {
-      if (video.current.ended) video.current.currentTime = 0;
+      if (video.current.ended) {
+        const element = video.current;
+        internalSeek.current = true;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => { cleanup(); reject(new Error('seek timeout')); }, 3000);
+            const cleanup = () => { clearTimeout(timeout); element.removeEventListener('seeked', done); };
+            const done = () => { cleanup(); resolve(); };
+            element.addEventListener('seeked', done, { once: true });
+            element.currentTime = 0;
+          });
+        } catch { setError('视频无法回到开头，请重新选择文件。'); return; }
+        finally { internalSeek.current = false; }
+      }
       if (readMode || once || singleOnly) video.current.pause();
       else { try { await video.current.play(); } catch { setError('视频无法播放，请检查视频格式。'); return; } }
     }
@@ -209,7 +224,7 @@ export default function App() {
           <div className="card-heading"><h2>观察窗口</h2><span className={`status ${running ? 'on' : ''}`}><i/>{connecting ? '连接中' : busy ? '识别中' : running ? '自动观察中' : '待命'}</span></div>
           <div className="source-tabs" role="group" aria-label="输入来源"><button aria-pressed={source==='camera'} onClick={() => changeSource('camera')}>实时摄像头</button><button aria-pressed={source==='video'} onClick={() => changeSource('video')}>路线视频回放</button></div>
           <div className={`viewport ${ready ? 'has-video' : ''}`}>
-            <video ref={video} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video') invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
+            <video ref={video} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
             {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true"><span>◎</span></div><h3>{source==='camera' ? '准备好，看看周围' : '从一段路线开始'}</h3><p>{source==='camera' ? '点击开始后，允许浏览器使用摄像头' : '选择本地 MP4，使用同一条 AI 识别链路'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>

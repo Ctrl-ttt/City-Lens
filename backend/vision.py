@@ -43,11 +43,11 @@ def parse_result(content: str) -> VisionResult:
     if not isinstance(content, str) or len(content) > 12000:
         raise VisionError('invalid_model_output')
     cleaned = content.strip()
-    if cleaned.startswith('```') and cleaned.endswith('```'):
-        cleaned = cleaned.split('\n', 1)[1].rsplit('```', 1)[0].strip()
     try:
+        if cleaned.startswith('```') and cleaned.endswith('```'):
+            cleaned = cleaned.split('\n', 1)[1].rsplit('```', 1)[0].strip()
         return VisionResult.model_validate(json.loads(cleaned))
-    except (ValueError, ValidationError, TypeError):
+    except (ValueError, ValidationError, TypeError, IndexError):
         raise VisionError('invalid_model_output') from None
 
 

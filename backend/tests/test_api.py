@@ -1,0 +1,132 @@
+import asyncio
+import io
+import json
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
+
+from backend.app import create_app
+from backend.vision import Settings
+
+
+def jpeg():
+    output = io.BytesIO()
+    Image.new('RGB', (32, 24), 'white').save(output, format='JPEG')
+    return output.getvalue()
+
+
+def analyze(client, mode='walk', **overrides):
+    fields = dict(mode=mode, source='camera', session_id='test-session', frame_id='1')
+    fields.update(overrides)
+    return client.post('/api/analyze', data=fields, files={'image': ('frame.jpg', jpeg(), 'image/jpeg')})
+
+
+def test_sample_contract_and_health():
+    with TestClient(create_app(Settings(provider='sample'))) as client:
+        health = client.get('/api/health').json()
+        assert health['provider'] == 'sample'
+        assert health['model'] == 'fixed-sample'
+        response = analyze(client)
+        assert response.status_code == 200
+        assert response.headers['cache-control'] == 'no-store'
+        result = response.json()
+        assert (result['session_id'], result['frame_id']) == ('test-session', 1)
+        assert result['speech']['text'] == '右前方发现自行车'
+        assert result['speech']['priority'] == 'high'
+        assert analyze(client, 'read').json()['speech']['text'].startswith('标牌文字：样例牌')
+
+
+@pytest.mark.parametrize('scene,mode,status,speech', [
+    ('empty', 'walk', 'ok', None),
+    ('unclear', 'walk', 'uncertain', None),
+    ('empty', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
+    ('unclear', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
+])
+def test_empty_and_unclear(scene, mode, status, speech):
+    with TestClient(create_app(Settings(provider='sample', sample_scene=scene))) as client:
+        result = analyze(client, mode).json()
+        assert result['status'] == status
+        assert result['events'] == []
+        assert (result['speech']['text'] if result['speech'] else None) == speech
+
+
+@pytest.mark.parametrize('status,body,code', [
+    (401, {}, 'model_auth'), (403, {}, 'model_auth'),
+    (429, {}, 'rate_limited'), (503, {}, 'model_unavailable'),
+    (200, {}, 'invalid_model_output'),
+    (200, {'choices': [{'message': {'content': '```'}}]}, 'invalid_model_output'),
+    (200, {'choices': [{'message': {'content': '{"events": [{"label": "invented"}]}'}}]}, 'invalid_model_output'),
+])
+def test_provider_errors_are_controlled(status, body, code):
+    transport = httpx.MockTransport(lambda request: httpx.Response(status, json=body))
+    with TestClient(create_app(Settings(api_key='test-secret'), transport)) as client:
+        response = analyze(client)
+        result = response.json()
+        assert result['status'] == 'error'
+        assert result['error_code'] == code
+        assert result['speech'] is None
+        assert 'test-secret' not in response.text + client.get('/api/health').text
+
+
+def test_live_adapter_sends_image_and_uses_validated_rules():
+    def handler(request):
+        assert request.url.path.endswith('/chat/completions')
+        payload = json.loads(request.content)
+        assert payload['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/jpeg;base64,')
+        content = {'events': [{'category': 'obstacle', 'label': 'bicycle', 'direction': 'left', 'text': '现在可以过马路'}]}
+        return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(content)}}]})
+    with TestClient(create_app(Settings(api_key='test-only'), httpx.MockTransport(handler))) as client:
+        assert analyze(client).json()['speech']['text'] == '左前方发现自行车'
+
+
+def test_missing_configuration_never_falls_back_to_samples():
+    with TestClient(create_app(Settings())) as client:
+        assert client.get('/api/health').json()['configured'] is False
+        assert analyze(client).json()['error_code'] == 'not_configured'
+
+
+@pytest.mark.parametrize('kind', ['timeout', 'network'])
+def test_timeout_and_network(kind):
+    async def handler(request):
+        if kind == 'network':
+            raise httpx.ConnectError('private upstream details', request=request)
+        await asyncio.sleep(.1)
+        return httpx.Response(200, json={})
+    with TestClient(create_app(Settings(api_key='test', timeout=.01), httpx.MockTransport(handler))) as client:
+        result = analyze(client).json()
+        assert result['error_code'] == ('network_error' if kind == 'network' else 'model_timeout')
+        assert 'private' not in result['message']
+
+
+@pytest.mark.parametrize('overrides', [{'mode': 'navigate'}, {'source': 'other'}, {'frame_id': '-1'}, {'session_id': '../bad'}])
+def test_invalid_metadata(overrides):
+    with TestClient(create_app(Settings(provider='sample'))) as client:
+        assert analyze(client, **overrides).status_code == 422
+
+
+@pytest.mark.parametrize('data,mime,status', [(b'not a jpeg', 'image/jpeg', 422), (b'x', 'image/png', 422), (b'x' * (2 * 1024 * 1024 + 1), 'image/jpeg', 413)], ids=['invalid-jpeg', 'wrong-mime', 'oversize'])
+def test_invalid_upload(data, mime, status):
+    with TestClient(create_app(Settings(provider='sample'))) as client:
+        response = client.post('/api/analyze', data=dict(mode='walk', source='video', session_id='s', frame_id='0'), files={'image': ('x.jpg', data, mime)})
+        assert response.status_code == status
+        assert response.json()['speech'] is None
+
+
+def test_foreign_origin_rejected():
+    with TestClient(create_app(Settings(provider='sample'))) as client:
+        response = client.post('/api/analyze', headers={'origin': 'https://example.com'})
+        assert response.status_code == 403
+        assert response.json()['error_code'] == 'forbidden_origin'
+
+
+def test_busy_request_is_not_queued():
+    with TestClient(create_app(Settings(provider='sample'))) as client:
+        client.portal.call(client.app.state.lock.acquire)
+        try:
+            response = analyze(client)
+            assert response.status_code == 429
+            assert response.json()['error_code'] == 'busy'
+        finally:
+            client.portal.call(client.app.state.lock.release)
