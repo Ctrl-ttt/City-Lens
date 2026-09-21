@@ -77,8 +77,15 @@ API Key 只放后端，不能填入前端代码或提交仓库。不把密钥发
 
 ## 项目记录
 
+- [文档中心与维护规则](docs/README.md)
+- [产品需求文档（PRD）](docs/PRD.md)
+- [架构与云端部署边界](docs/ARCHITECTURE.md)
 - [最新进度与下一步](docs/PROGRESS.md)
 - [API 契约](docs/API.md)
+- [数据模型与数据治理](docs/DATA_MODEL.md)
+- [测试设计与发布门槛](docs/TEST_STRATEGY.md)
+- [ECS、OSS、RAM 与运行手册](docs/OPERATIONS.md)
+- [架构决策记录](docs/DECISIONS.md)
 - [四人分工与交付检查表](docs/TEAM.md)
 - [访谈、评测与人工验收模板](docs/VALIDATION.md)
 
