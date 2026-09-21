@@ -77,17 +77,17 @@ API Key 只放后端，不能填入前端代码或提交仓库。不把密钥发
 
 ## 项目记录
 
-- [组队提案书](docs/PROPOSAL.md)
-- [文档中心与维护规则](docs/README.md)
-- [产品需求文档（PRD）](docs/PRD.md)
-- [架构与云端部署边界](docs/ARCHITECTURE.md)
-- [最新进度与下一步](docs/PROGRESS.md)
-- [API 契约](docs/API.md)
-- [数据模型与数据治理](docs/DATA_MODEL.md)
-- [测试设计与发布门槛](docs/TEST_STRATEGY.md)
-- [ECS、OSS、RAM 与运行手册](docs/OPERATIONS.md)
-- [架构决策记录](docs/DECISIONS.md)
-- [四人分工与交付检查表](docs/TEAM.md)
-- [访谈、评测与人工验收模板](docs/VALIDATION.md)
+- [组队提案书](docs/组队提案书.md)
+- [文档中心与维护规则](docs/文档中心.md)
+- [产品需求文档（PRD）](docs/产品需求文档.md)
+- [架构与云端部署边界](docs/架构与云端边界.md)
+- [最新进度与下一步](docs/项目进度.md)
+- [API 契约](docs/接口契约.md)
+- [数据模型与数据治理](docs/数据模型与数据治理.md)
+- [测试设计与发布门槛](docs/测试策略与发布门槛.md)
+- [ECS、OSS、RAM 与运行手册](docs/运维手册.md)
+- [架构决策记录](docs/架构决策记录.md)
+- [四人分工与交付检查表](docs/团队分工与交付检查表.md)
+- [访谈、评测与人工验收模板](docs/验收记录.md)
 
 `frontend/pnpm-lock.yaml` 和 `backend/requirements.txt` 固定本次验证依赖。`backend/requirements.in` 用于有意更新依赖时重新解析，日常安装使用 `.txt`。
