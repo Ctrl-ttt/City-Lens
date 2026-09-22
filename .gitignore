@@ -21,3 +21,5 @@ native/link2/build/
 test/
 *.insv
 *.mp4
+.pnpm-store/
+vibe_images/
