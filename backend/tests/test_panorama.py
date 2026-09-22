@@ -1,5 +1,6 @@
 import io
 import json
+import math
 
 import httpx
 import numpy as np
@@ -9,7 +10,7 @@ from PIL import Image
 
 from backend.app import create_app
 from backend.models import AnalyzeInput, Observation, SpatialObservation, VisionResult
-from backend.panorama import FACE_SIZE, HEADER, bearing, direction_from_bearing, prepare_panorama
+from backend.panorama import FACE_SIZE, HEADER, FACES, angular_span, bearing, direction_from_bearing, prepare_panorama
 from backend.rules import summarize
 from backend.spatial import SpatialSessions, compatible
 from backend.vision import Settings, VisionError, parse_result
@@ -100,17 +101,65 @@ def test_width_fallback_tracks_growth_but_never_mixes_axes():
     assert events[0].distance_basis=='apparent_size' and not events[0].approaching
 
 
-def test_rear_track_survives_an_atlas_seam_when_spherical_angle_is_stable():
-    a=SpatialObservation(**event('person','back',[650,400,800,920]).model_dump(),yaw_deg=150,pitch_deg=-20,distance_basis='apparent_width')
-    b=SpatialObservation(**event('person','left',[820,420,1000,920]).model_dump(),yaw_deg=-175,pitch_deg=-21,distance_basis='apparent_width')
-    assert compatible(a,b)
+def angular_person(yaw, height_degrees):
+    """Project an upright target of known angular height onto its nearest face."""
+    view = min(['front', 'right', 'back', 'left'],
+               key=lambda name: abs((yaw-FACES[name][0]+180)%360-180))
+    delta = math.radians((yaw-FACES[view][0]+180)%360-180)
+    x = 500*(1+math.tan(delta))
+    half_height = 500*math.tan(math.radians(height_degrees)/2)/math.cos(delta)
+    return event('person', view, [round(x-15), round(500-half_height), round(x+15), round(500+half_height)])
 
 
-def test_spherical_seam_association_triggers_only_on_monotonic_growth():
-    tracker=SpatialSessions(); observations=[]
-    assert compatible(
-        SpatialObservation(**event('person','back',[400,400,600,940]).model_dump(),yaw_deg=178,pitch_deg=-20,distance_basis='apparent_width'),
-        SpatialObservation(**event('person','left',[800,400,1000,940]).model_dump(),yaw_deg=-170,pitch_deg=-20,distance_basis='apparent_width'))
+@pytest.mark.parametrize('yaws', [[130, 140, 155], [180, 165, 146], [170, 179, -170]])
+def test_constant_angular_size_never_approaches_despite_perspective_or_seam(yaws):
+    tracker = SpatialSessions()
+    for i, yaw in enumerate(yaws):
+        raw = angular_person(yaw, 38)
+        assert math.degrees(angular_span(raw, 1)) == pytest.approx(38, abs=0.2)
+        events, _ = tracker.process(meta(i+1), VisionResult(events=[raw]), 960, 480, Settings(), i*2)
+        assert not events[0].approaching
+    # Association survived; the negative result isn't merely a track reset.
+    assert len(tracker.sessions['panorama-test'].tracks[0].scales) == 3
+
+
+def test_spherical_seam_association_triggers_on_angular_growth():
+    tracker = SpatialSessions()
+    for i, (yaw, extent) in enumerate(zip([130, 140, 155], [25, 32, 41])):
+        events, _ = tracker.process(meta(i+1), VisionResult(events=[angular_person(yaw, extent)]),
+                                    960, 480, Settings(), i*2)
+        assert events[0].approaching == (i == 2)
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_associations_use_immutable_previous_frame_regardless_of_event_order(reverse):
+    tracker = SpatialSessions()
+    for i, (yaws, extent) in enumerate(zip([[130, 180], [147, 166], [130, 180]], [30, 38, 48])):
+        observations = [angular_person(yaw, extent) for yaw in yaws]
+        events, _ = tracker.process(meta(i+1), VisionResult(events=observations[::-1] if reverse else observations),
+                                    960, 480, Settings(), i*2)
+    assert all(e.approaching for e in events)
+    assert [len(t.scales) for t in tracker.sessions['panorama-test'].tracks] == [3, 3]
+
+
+def test_polar_face_switch_resets_incompatible_axis_history():
+    a = SpatialObservation(**event('person', 'back', [400, 0, 600, 200]).model_dump(), distance_basis='apparent_width')
+    b = SpatialObservation(**event('person', 'up', [400, 0, 600, 200]).model_dump(), distance_basis='apparent_width')
+    a.yaw_deg, a.pitch_deg = bearing(a)
+    b.yaw_deg, b.pitch_deg = bearing(b)
+    assert not compatible(a, b)
+
+
+def test_rear_side_approach_has_urgent_score_before_front_hazards():
+    tracker = SpatialSessions()
+    for i, extent in enumerate([25, 32, 41]):
+        events, _ = tracker.process(meta(i+1), VisionResult(events=[angular_person(125, extent)]),
+                                    960, 480, Settings(), i*2)
+    assert events[0].direction == 'right' and events[0].approaching
+    front = SpatialObservation(**event('stairs').model_dump(), proximity='near')
+    response = summarize(meta(), VisionResult(), spatial=[front, *events])
+    assert response.speech.priority == 'urgent'
+    assert response.speech.text.startswith('后方行人疑似靠近')
 
 
 def test_width_fallback_does_not_treat_height_crop_changes_as_motion():

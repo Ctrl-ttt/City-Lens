@@ -79,20 +79,37 @@ def prepare_panorama(data: bytes, meta: AnalyzeInput) -> bytes:
     return out.getvalue()
 
 
-def bearing(event: Observation) -> tuple[float, float] | None:
-    """Map a perspective face's local center to panorama-relative yaw/pitch."""
-    if event.view not in FACES:
-        return None
-    yaw, pitch = map(math.radians, FACES[event.view])
-    x = y = 0.0
-    if event.box:
-        x = (event.box[0] + event.box[2]) / 1000 - 1
-        y = 1 - (event.box[1] + event.box[3]) / 1000
+def face_ray(view: str, x: float, y: float) -> np.ndarray:
+    """Unit ray for a 90-degree face; x/y use local 0..1000 coordinates."""
+    yaw, pitch = map(math.radians, FACES[view])
     # Forward/right/up basis: positive yaw is to the right; positive pitch is up.
     forward = np.array([math.sin(yaw)*math.cos(pitch), math.sin(pitch), math.cos(yaw)*math.cos(pitch)])
     right = np.array([math.cos(yaw), 0, -math.sin(yaw)])
     up = np.cross(forward, right)
-    ray = forward + x * right + y * up
+    ray = forward + (x / 500 - 1) * right + (1 - y / 500) * up
+    return ray / np.linalg.norm(ray)
+
+
+def angular_span(event: Observation, axis: int) -> float | None:
+    """Angular box extent, comparable across horizontal faces (not metric size)."""
+    if event.view not in FACES or not event.box:
+        return None
+    x1, y1, x2, y2 = event.box
+    if axis == 0:
+        a = face_ray(event.view, x1, (y1 + y2) / 2)
+        b = face_ray(event.view, x2, (y1 + y2) / 2)
+    else:
+        a = face_ray(event.view, (x1 + x2) / 2, y1)
+        b = face_ray(event.view, (x1 + x2) / 2, y2)
+    return math.acos(float(np.clip(np.dot(a, b), -1, 1)))
+
+
+def bearing(event: Observation) -> tuple[float, float] | None:
+    """Map a perspective face's local center to panorama-relative yaw/pitch."""
+    if event.view not in FACES:
+        return None
+    x, y = ((event.box[0] + event.box[2]) / 2, (event.box[1] + event.box[3]) / 2) if event.box else (500, 500)
+    ray = face_ray(event.view, x, y)
     return (math.degrees(math.atan2(ray[0], ray[2])),
             math.degrees(math.atan2(ray[1], math.hypot(ray[0], ray[2]))))
 

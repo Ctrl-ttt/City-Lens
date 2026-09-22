@@ -5,7 +5,7 @@ import math
 
 from .distance import estimate_distance_m, estimate_person_width_m
 from .models import AnalyzeInput, SpatialObservation, VisionResult
-from .panorama import bearing, direction_from_bearing
+from .panorama import angular_span, bearing, direction_from_bearing
 
 
 @dataclass
@@ -29,21 +29,32 @@ def center(box):
     return ((box[0]+box[2])/2, (box[1]+box[3])/2)
 
 
+def scale(event, axis):
+    if event.yaw_deg is not None:
+        return angular_span(event, axis)
+    return event.box[axis+2]-event.box[axis] if event.box else None
+
+
 def compatible(a, b):
     if a.label != b.label or not a.box or not b.box:
         return False
     if a.yaw_deg is not None and b.yaw_deg is not None:
-        yaw_delta = abs((a.yaw_deg - b.yaw_deg + 180) % 360 - 180)
-        if yaw_delta > 35 or abs((a.pitch_deg or 0) - (b.pitch_deg or 0)) > 30:
+        # Polar faces rotate the meaning of local width/height. Start fresh there.
+        if a.view != b.view and ({a.view, b.view} & {'up', 'down'}):
             return False
-    elif a.view != b.view or a.direction != b.direction:
+        p1, p2 = math.radians(a.pitch_deg or 0), math.radians(b.pitch_deg or 0)
+        cosine = math.sin(p1)*math.sin(p2) + math.cos(p1)*math.cos(p2)*math.cos(math.radians(a.yaw_deg-b.yaw_deg))
+        if math.degrees(math.acos(max(-1, min(1, cosine)))) > 20:
+            return False
+    elif a.yaw_deg is not None or b.yaw_deg is not None or a.view != b.view or a.direction != b.direction:
         return False
-    ax, ay = center(a.box); bx, by = center(b.box)
+    else:
+        ax, ay = center(a.box); bx, by = center(b.box)
+        if math.hypot(ax-bx, ay-by) >= 100:
+            return False
     axis = 0 if a.distance_basis == b.distance_basis == 'apparent_width' else 1
-    ratio = (a.box[axis+2]-a.box[axis]) / (b.box[axis+2]-b.box[axis])
-    # Across a 90-degree atlas seam the normalized box jumps; angular gating above
-    # is the reliable association signal. Scale still rejects impossible identity jumps.
-    return (math.hypot(ax-bx, ay-by) < 100 and 0.4 < ratio < 2.5) if a.view == b.view else 0.4 < ratio < 2.5
+    size_a, size_b = scale(a, axis), scale(b, axis)
+    return bool(size_a and size_b and 0.65 < size_a / size_b < 1.55)
 
 
 class SpatialSessions:
@@ -115,13 +126,17 @@ class SpatialSessions:
             matches = [t for t in old if compatible(event, t.event)]
             # Ambiguous same-class associations reset motion; never join different people into an approach.
             match = matches[0] if len(matches) == 1 and sum(compatible(e, matches[0].event) for e in enriched) == 1 else None
-            track = match or Track(event, now)
+            # Copy matched history: every association in this frame must see the
+            # same previous frame, regardless of the model's event ordering.
+            track = Track(event, now, deque(match.scales, maxlen=3), match.basis) if match else Track(event, now)
             if event.distance_basis != track.basis:
                 track.scales.clear()
                 track.basis = event.distance_basis
             if event.box and track.basis != 'unknown':
                 axis = 0 if track.basis == 'apparent_width' else 1
-                track.scales.append((now, event.box[axis+2]-event.box[axis]))
+                extent = scale(event, axis)
+                if extent:
+                    track.scales.append((now, extent))
             rear = event.direction == 'back' or (event.yaw_deg is not None and abs(event.yaw_deg) >= 120)
             if len(track.scales) == 3 and rear and event.proximity == 'near':
                 (t0,h0),(t1,h1),(t2,h2) = track.scales

@@ -15,7 +15,7 @@ def score(event):
         return 5  # Background roofs stay in details; they must not fill idle speech slots.
     if event.category == 'text':
         return 10 - CLARITY_ORDER.get(event.clarity, 2)
-    if event.approaching and event.direction == 'back' and event.proximity == 'near':
+    if event.approaching and event.proximity == 'near':
         return 160
     return RISK.get(event.label, 25) + POSITION[event.direction] + PROXIMITY[event.proximity]
 
