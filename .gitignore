@@ -19,3 +19,5 @@ release/
 native/link2/build/
 
 test/
+*.insv
+*.mp4

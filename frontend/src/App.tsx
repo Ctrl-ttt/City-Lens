@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Accessibility, ALargeSmall, Camera, Contrast, FileVideo, Headphones, Info, Pause, Play, RotateCcw, ScanText, Square, Volume2, VolumeX } from 'lucide-react';
-import type { Analysis, Channel, Health, Mode, RealtimeState, Source } from './types';
+import type { Analysis, Channel, Health, Mode, Projection, RealtimeState, Source } from './types';
 import { SessionGate } from './session';
 import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from './speech';
 import { captureRealtimeFrame, RealtimeClient } from './realtime';
@@ -9,7 +9,7 @@ import Link2Controls from './Link2Controls';
 import './brand.css';
 
 const sourceNames = { camera: '实时摄像头', video: '路线视频回放' };
-const directionNames = { left: '左前方', front: '前方', right: '右前方', unknown: '画面中' };
+const directionNames = { left: '左侧', front: '前方', right: '右侧', back: '后方', above: '上方', unknown: '画面中' };
 
 export default function App() {
   const video = useRef<HTMLVideoElement>(null);
@@ -30,6 +30,8 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [healthError, setHealthError] = useState('');
   const [source, setSource] = useState<Source>('camera');
+  const [projection, setProjection] = useState<Projection>('rectilinear');
+  const [heading, setHeading] = useState(0);
   const [mode, setMode] = useState<Mode>('walk');
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -88,6 +90,7 @@ export default function App() {
     if (message) setNotice(message);
   }
   function changeChannel(next: Channel) {
+    if (projection === 'equirectangular' && next === 'realtime') return;
     if (next === channelRef.current || health?.provider === 'sample') return;
     invalidate('识别通道已切换，请重新开始');
     if (sourceRef.current === 'video') video.current?.pause();
@@ -106,6 +109,13 @@ export default function App() {
     if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
     objectUrl.current = null; setFileName(''); setReady(false); setError('');
     sourceRef.current = next; setSource(next);
+    setProjection('rectilinear'); setHeading(0);
+  }
+  function changeProjection(next: Projection) {
+    invalidate('画面格式已切换，请确认正前方后重新开始');
+    if (sourceRef.current === 'video') video.current?.pause();
+    setProjection(next); setHeading(0);
+    if (next === 'equirectangular') { channelRef.current = 'http'; setChannel('http'); }
   }
   function pause() {
     invalidate('已暂停。按开始恢复识别');
@@ -214,7 +224,21 @@ export default function App() {
         finally { internalSeek.current = false; }
       }
       if (session !== gate.current.session) return;
-      if (readMode || once || singleOnly) video.current.pause();
+      if (readMode || once || singleOnly) {
+        const element = video.current;
+        // HAVE_CURRENT_DATA may precede the first usable decoded frame on Edge.
+        // Advance only an unstarted clip; subsequent keypresses keep its paused position.
+        if (element.currentTime === 0 && 'requestVideoFrameCallback' in element) {
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => { element.cancelVideoFrameCallback(id); reject(new Error('frame timeout')); }, 3000);
+              const id = element.requestVideoFrameCallback(() => { clearTimeout(timer); resolve(); });
+              void element.play().catch(reason => { clearTimeout(timer); element.cancelVideoFrameCallback(id); reject(reason); });
+            });
+          } catch { if (session === gate.current.session) setError('视频首帧尚未就绪，请播放后暂停再识别。'); return; }
+          finally { if (session === gate.current.session) element.pause(); }
+        } else element.pause();
+      }
       else { try { await video.current.play(); } catch { if (session === gate.current.session) setError('视频无法播放，请检查视频格式。'); return; } }
     }
     if (session !== gate.current.session) return;
@@ -291,10 +315,11 @@ export default function App() {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       canvas = document.createElement('canvas');
-      const scale = Math.min(1, (requestedMode === 'read' ? 1280 : 960) / Math.max(element.videoWidth, element.videoHeight));
+      if (projection === 'equirectangular' && Math.abs(element.videoWidth / element.videoHeight - 2) > 0.04) throw new Error('请选择已拼接的 2:1 全景 MP4；双鱼眼原片不能直接识别。');
+      const scale = Math.min(1, (projection === 'equirectangular' ? 1920 : requestedMode === 'read' ? 1280 : 960) / Math.max(element.videoWidth, element.videoHeight));
       canvas.width = Math.round(element.videoWidth * scale); canvas.height = Math.round(element.videoHeight * scale);
       const context = canvas.getContext('2d')!;
-      if (sourceRef.current === 'camera') context.setTransform(-1, 0, 0, 1, canvas.width, 0);
+      if (sourceRef.current === 'camera' && projection === 'rectilinear') context.setTransform(-1, 0, 0, 1, canvas.width, 0);
       context.drawImage(element, 0, 0, canvas.width, canvas.height);
       const blob = await new Promise<Blob | null>(resolve => canvas!.toBlob(resolve, 'image/jpeg', 0.75));
       if (!gate.current.current(ticket)) return;
@@ -302,6 +327,7 @@ export default function App() {
       const form = new FormData();
       form.append('image', blob, 'frame.jpg'); form.append('mode', requestedMode); form.append('source', sourceRef.current);
       form.append('session_id', ticket.session); form.append('frame_id', String(ticket.frame));
+      form.append('projection', projection); form.append('heading_deg', String(heading));
       timer = setTimeout(() => ticket.controller.abort(), 9000);
       const response = await fetch('/api/analyze', { method: 'POST', body: form, signal: ticket.controller.signal });
       const data: Analysis = await response.json();
@@ -373,8 +399,9 @@ export default function App() {
       <section className="control-card" id="controls" aria-labelledby="control-title">
         <div className="control-top"><div><p className="section-index">操作</p><h2 id="control-title">开始了解周围环境</h2></div><label className="switch-label"><input type="checkbox" checked={singleOnly} onChange={e => { invalidate('识别方式已切换'); setSingleOnly(e.target.checked); }}/><span>只用按键识别</span></label></div>
         <fieldset className="source-field"><legend>输入来源</legend><div className="source-tabs"><button aria-pressed={source==='camera'} onClick={() => changeSource('camera')}><Camera aria-hidden="true"/>实时摄像头</button><button aria-pressed={source==='video'} onClick={() => changeSource('video')}><FileVideo aria-hidden="true"/>路线视频回放</button></div></fieldset>
-        {health && health.provider !== 'sample' && <fieldset className="channel-field"><legend>识别通道</legend><div className="source-tabs"><button aria-pressed={channel==='realtime'} disabled={!realtimeConfigured} onClick={() => changeChannel('realtime')}>实时连接</button><button aria-pressed={channel==='http'} disabled={!httpConfigured} onClick={() => changeChannel('http')}>HTTP 抽帧</button></div><p className="quiet-note">{channel === 'realtime' ? '浏览器以 1 fps 连续送帧；发送不等待分析。云端仍串行处理，忙时后端只保留最新待分析帧，结果可跳帧；不是云端双工或安全导航。' : 'HTTP 通道每两秒尝试抽帧。'} 未使用麦克风；手动看牌始终使用 HTTP。</p>{channel === 'realtime' && <p className="connection-state" role="status" aria-label="实时连接状态">实时连接：{connectionNames[connectionState]}</p>}</fieldset>}
-        <p className="quiet-note">环境识别会自动读路牌：障碍优先，文字按清晰度排序，不估计距离；同一文字 8 秒内不重复播报。看不清时可调整角度，再手动看牌。</p>
+        {health && health.provider !== 'sample' && <fieldset className="channel-field"><legend>识别通道</legend><div className="source-tabs"><button aria-pressed={channel==='realtime'} disabled={!realtimeConfigured || projection === 'equirectangular'} onClick={() => changeChannel('realtime')}>实时连接</button><button aria-pressed={channel==='http'} disabled={!httpConfigured} onClick={() => changeChannel('http')}>HTTP 抽帧</button></div><p className="quiet-note">{channel === 'realtime' ? '浏览器以 1 fps 连续送帧；发送不等待分析。云端仍串行处理，忙时后端只保留最新待分析帧，结果可跳帧；不是云端双工或安全导航。' : 'HTTP 通道每两秒尝试抽帧。'} 未使用麦克风；手动看牌始终使用 HTTP。</p>{channel === 'realtime' && <p className="connection-state" role="status" aria-label="实时连接状态">实时连接：{connectionNames[connectionState]}</p>}</fieldset>}
+        <fieldset className="source-field"><legend>画面格式</legend><label>输入格式 <select aria-label="画面格式" value={projection} onChange={e => changeProjection(e.target.value as Projection)}><option value="rectilinear">普通固定视角</option><option value="equirectangular">360° 全景（已拼接 2:1）</option></select></label>{projection === 'equirectangular' && <><p className="quiet-note">请使用 Insta360 Studio 导出的全景 MP4。HTTP 通道一次分析前、左、右、后、上、下六个方向；请保持相机朝向固定。原始 INSV 暂不直接播放。</p><label>正前方在全景中的角度：{heading}° <input aria-label="正前方角度" type="range" min="-180" max="180" step="15" value={heading} onChange={e => { invalidate('正前方已调整，请重新开始'); video.current?.pause(); setHeading(Number(e.target.value)); }}/></label><p className="quiet-note">0° 对应画面横向中央，+90° 对应画面右侧四分之三处；以路线前进方向校准。方向不随用户转头自动更新。</p></>}</fieldset>
+        <p className="quiet-note">结合物体类型、方向和粗略远近选择提示，每次最多两项，优先前方并兼顾侧方和上方；后方疑似靠近需连续帧支持。远近仅辅助排序，不提供测距或通行判断。</p>
         <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
         <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : mode==='read' ? <><Play aria-hidden="true"/>▶ 返回环境识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || cameraControlBusy || (busy && (channel === 'http' || mode === 'read'))} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
       </section>
@@ -382,15 +409,15 @@ export default function App() {
         <section className="camera-card" aria-label="画面输入">
           <div className="card-heading"><div><p className="section-index">画面</p><h2>观察窗口</h2></div><span className={`status ${running ? 'on' : ''}`}><i/>{connecting ? '连接中' : busy ? '识别中' : running ? '自动观察中' : '待命'}</span></div>
           <div className={`viewport ${ready ? 'has-video' : ''}`}>
-            <video ref={video} className={source === 'camera' ? 'camera-flipped' : undefined} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
+            <video ref={video} className={source === 'camera' && projection === 'rectilinear' ? 'camera-flipped' : undefined} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
             {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true">{source === 'camera' ? <Camera/> : <FileVideo/>}</div><h3>{source==='camera' ? '摄像头尚未开启' : '尚未选择路线视频'}</h3><p>{source==='camera' ? '可先仅本地预览，确认画面后开始识别' : '选择本地 MP4 后开始识别'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
           <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><button disabled={connecting} onClick={() => void previewCamera()}>仅本地预览</button><small>{activeCameraLabel ? `当前输入：${activeCameraLabel}` : '支持 Link 2 / USB 摄像头'} · 仅本地预览不会上传画面</small></>}</div>
           {source === 'camera' && <Link2Controls activeLabel={activeCameraLabel} cameraLabels={devices.map(d => d.label)} beforeControl={() => invalidate('相机画面正在调整，识别已暂停。确认画面稳定后重新开始。')} onControlBusyChange={pending => setCameraControlCount(count => count + (pending ? 1 : -1))}/>}
         </section>
-        <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 3 项</span></div>
-          <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{directionNames[event.direction]}</span></div>)}</div>
+        <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 6 项 · 播报最多 2 项</span></div>
+          <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{directionNames[event.direction]}{event.approaching ? " · 疑似靠近" : ""}{event.proximity && event.proximity !== "unknown" ? ` · 粗估${{near:"较近",mid:"中距",far:"较远"}[event.proximity]}` : ""}</span></div>)}</div>
           {!result?.events.length && <div className="empty-events"><Info aria-hidden="true"/><p>识别后，这里会列出当前画面中可确认的信息。</p></div>}
           <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : mode === 'read' || channel === 'http' ? 'HTTP 抽帧' : '实时连续帧流'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
           <p className="quiet-note">只提示当前画面中可确认的信息。没有提示，不代表前方安全。</p>

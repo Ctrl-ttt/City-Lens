@@ -4,7 +4,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Mode = Literal['walk', 'read']
 Source = Literal['camera', 'video']
+Projection = Literal['rectilinear', 'equirectangular']
+View = Literal['front', 'left', 'right', 'back', 'up', 'down']
 LABELS = {
+    'person': ('obstacle', '行人'),
+    'car': ('obstacle', '车辆'),
+    'motorcycle': ('obstacle', '摩托车'),
+    'overhead': ('obstacle', '悬空障碍'),
+    'canopy': ('facility', '顶棚'),
     'bicycle': ('obstacle', '自行车'),
     'barrier': ('obstacle', '围挡'),
     'bollard': ('obstacle', '路障'),
@@ -27,7 +34,8 @@ class StrictModel(BaseModel):
 class Observation(StrictModel):
     category: Literal['obstacle', 'facility', 'text']
     label: str = Field(max_length=24)
-    direction: Literal['left', 'front', 'right', 'unknown']
+    direction: Literal['left', 'front', 'right', 'back', 'above', 'unknown']
+    view: View | None = None
     text: str = Field(default='', max_length=80)
     clarity: Literal['high', 'medium', 'low'] | None = None
     box: list[int] | None = None
@@ -46,9 +54,11 @@ class Observation(StrictModel):
             return None
         try:
             coords = [round(float(item)) for item in value]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if any(item < 0 or item > 1000 for item in coords):
+            return None
+        if coords[2] <= coords[0] or coords[3] <= coords[1]:
             return None
         return coords
 
@@ -78,6 +88,8 @@ class AnalyzeInput(StrictModel):
     frame_id: int = Field(ge=0, le=2**31-1)
     mode: Mode
     source: Source
+    projection: Projection = 'rectilinear'
+    heading_deg: int = Field(default=0, ge=-180, le=180)
 
 
 class RealtimeFrame(AnalyzeInput):
@@ -88,15 +100,24 @@ class RealtimeFrame(AnalyzeInput):
 
 class Speech(StrictModel):
     key: str
-    priority: Literal['high', 'normal', 'low']
+    priority: Literal['urgent', 'high', 'normal', 'low']
     text: str
+
+
+class SpatialObservation(Observation):
+    # Derived by code, never accepted from a model response.
+    proximity: Literal['near', 'mid', 'far', 'unknown'] = 'unknown'
+    approaching: bool = False
+    yaw_deg: float | None = None
+    pitch_deg: float | None = None
+    distance_basis: Literal['apparent_size', 'apparent_width', 'unknown'] = 'unknown'
 
 
 class AnalyzeResponse(StrictModel):
     session_id: str
     frame_id: int
     status: Literal['ok', 'uncertain', 'error']
-    events: list[Observation] = Field(default_factory=list)
+    events: list[SpatialObservation] = Field(default_factory=list)
     speech: Speech | None = None
     latency_ms: int = 0
     error_code: str | None = None

@@ -12,6 +12,14 @@ function setup() {
 }
 
 describe('SpeechQueue', () => {
+  it('rear approach warning interrupts a normal high hazard and fences cancelled callbacks', () => {
+    const t = setup();
+    t.queue.offer(t.candidate('front-stairs', 'high'));
+    t.queue.offer(t.candidate('back-person-approaching', 'urgent'));
+    t.completions[0]();
+    expect(t.driver.cancel).toHaveBeenCalledTimes(1);
+    expect(t.driver.speak.mock.calls.map(c => c[0])).toEqual(['front-stairs', 'back-person-approaching']);
+  });
   it('suppresses repeats for 4 seconds, but permits manual replay', () => {
     const t = setup();
     t.queue.offer(t.candidate('bike')); t.completions[0]();

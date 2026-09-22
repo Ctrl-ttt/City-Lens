@@ -1,7 +1,7 @@
 import type { Speech } from './types';
 export type Candidate = Speech & { session: string; capturedAt: number; maxAge: number; manual?: boolean };
 export interface VoiceDriver { speak(text: string, done: () => void): void; cancel(): void }
-const rank = { high: 3, normal: 2, low: 1 };
+const rank = { urgent: 4, high: 3, normal: 2, low: 1 };
 
 /** Bounded queue (one newest candidate), deduplication, and generation checks. */
 export class SpeechQueue {

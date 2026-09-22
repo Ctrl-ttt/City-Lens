@@ -56,7 +56,7 @@ class RealtimeVision:
                 # VAD discards silent PCM; manual input must stop during generation.
                 'modalities': ['text'], 'turn_detection': None,
                 'instructions': INSTRUCTIONS, 'input_audio_format': 'pcm16',
-                'max_response_output_tokens': 450,
+                'max_response_output_tokens': 1200,
             })
             while (await self.receive())['type'] != 'session.updated':
                 pass
