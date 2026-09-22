@@ -77,12 +77,15 @@ def load_settings():
     return Settings(provider=provider, api_key=os.getenv('DASHSCOPE_API_KEY', '').strip(),
                     base_url=os.getenv('DASHSCOPE_BASE_URL', Settings.base_url).strip(),
                     model=os.getenv('DASHSCOPE_MODEL', Settings.model).strip(),
+                    read_model=os.getenv('DASHSCOPE_READ_MODEL', '').strip(),
                     realtime_model=os.getenv('DASHSCOPE_REALTIME_MODEL', Settings.realtime_model).strip(),
                     realtime_url=os.getenv('DASHSCOPE_REALTIME_URL', '').strip(),
                     sample_scene=os.getenv('CITYLENS_SAMPLE_SCENE', 'bicycle'),
                     max_distance_m=float_env('CITYLENS_MAX_DISTANCE_M', 5.0),
                     camera_hfov_deg=float_env('CITYLENS_CAMERA_HFOV_DEG', 75.0),
-                    speech_repeat_seconds=float_env('CITYLENS_SPEECH_REPEAT_SECONDS', 4.0))
+                    speech_repeat_seconds=float_env('CITYLENS_SPEECH_REPEAT_SECONDS', 4.0),
+                    min_confidence=float_env('CITYLENS_MIN_CONFIDENCE', 0.5),
+                    continuous_repeat_seconds=float_env('CITYLENS_CONTINUOUS_REPEAT_SECONDS', 12.0))
 
 
 def clean_jpeg(data: bytes, max_side=2048, quality=85) -> bytes:
@@ -209,7 +212,8 @@ def create_app(settings: Settings | None = None, transport=None):
                                 generating = False
                                 del image
                             spatial, recent = app.state.spatial.process(frame, result, img_w, img_h, config, received_at)
-                            response = summarize(frame, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial)
+                            response = summarize(frame, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial,
+                                                 min_confidence=config.min_confidence, continuous_repeat_seconds=config.continuous_repeat_seconds)
                             response.latency_ms = int((time.monotonic() - received_at) * 1000)
                             await socket.send_json({'type': 'result', **response.model_dump()})
                             logger.info('realtime status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
@@ -291,7 +295,8 @@ def create_app(settings: Settings | None = None, transport=None):
                     result = await observe(image, meta.mode, config, app.state.client)
             img_w, img_h = jpeg_dimensions(image)
             spatial, recent = app.state.spatial.process(meta, result, img_w, img_h, config, started)
-            response = summarize(meta, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial)
+            response = summarize(meta, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial,
+                                 min_confidence=config.min_confidence, continuous_repeat_seconds=config.continuous_repeat_seconds)
             response.latency_ms = int((time.monotonic()-started)*1000)
             logger.info('analyze status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
             return JSONResponse(response.model_dump(), headers={'Cache-Control':'no-store'})

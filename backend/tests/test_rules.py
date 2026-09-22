@@ -1,7 +1,7 @@
 import json
 
 import pytest
-from backend.models import AnalyzeInput, VisionResult
+from backend.models import AnalyzeInput, SpatialObservation, VisionResult
 from backend.rules import summarize
 from backend.vision import parse_result, VisionError
 
@@ -14,15 +14,27 @@ def sign(text='中山路', clarity='high', direction='front'):
     return dict(category='text', label='sign', direction=direction, text=text, clarity=clarity)
 
 
-def summary(events, mode='walk', uncertain=False):
+def obstacle(label='bicycle', direction='front', proximity='unknown', confidence=None, approaching=False):
+    return SpatialObservation(category='obstacle', label=label, direction=direction,
+                              proximity=proximity, approaching=approaching, confidence=confidence)
+
+
+def summary(events, mode='walk', uncertain=False, min_confidence=0.0, continuous_repeat_seconds=0.0):
     return summarize(AnalyzeInput(mode=mode, source='video', session_id='s', frame_id=3),
-                     VisionResult.model_validate({'events': events, 'uncertain': uncertain}))
+                     VisionResult.model_validate({'events': events, 'uncertain': uncertain}),
+                     min_confidence=min_confidence, continuous_repeat_seconds=continuous_repeat_seconds)
 
 
-def test_priority_dedup_limit_keeps_obstacles_before_signs():
+def spatial_summary(events, mode='walk', min_confidence=0.0):
+    return summarize(AnalyzeInput(mode=mode, source='video', session_id='s', frame_id=3),
+                     VisionResult.model_validate({'events': events}), spatial=events,
+                     min_confidence=min_confidence)
+
+
+def test_walk_excludes_signs_and_keeps_priority_dedup_limit():
     response = summary([sign(), event('bus_stop', 'facility'), event('bicycle'),
                         event('stairs'), event('stairs'), event('barrier')])
-    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'barrier', 'bus_stop', 'sign']
+    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'barrier', 'bus_stop']
     assert response.speech.text == '前方发现楼梯；前方发现自行车'
     assert response.speech.priority == 'high'
 
@@ -50,17 +62,17 @@ def test_escalator_is_a_facility_and_keeps_model_category():
     assert response.speech.priority == 'low'
 
 
-def test_walk_ranks_facilities_before_signs_by_danger_priority():
+def test_walk_drops_signs_and_keeps_facility_priority():
     response = summary([event('entrance', 'facility'), sign()])
-    assert [e.label for e in response.events] == ['entrance', 'sign']
+    assert [e.label for e in response.events] == ['entrance']
     assert response.speech.model_dump() == {
         'key': 'entrance:front', 'text': '前方发现出入口', 'priority': 'low'}
 
 
-def test_danger_tiers_order_steps_obstacles_facilities_then_signs():
+def test_danger_tiers_order_steps_obstacles_then_facilities():
     response = summary([sign(), event('escalator', 'facility'),
                         event('bicycle'), event('stairs')])
-    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'escalator', 'sign']
+    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'escalator']
     assert response.speech.text == '前方发现楼梯；前方发现自行车'
 
 
@@ -75,23 +87,27 @@ def test_collision_tier_orders_front_before_sides():
 def test_signs_are_sorted_by_clarity_not_input_order_or_direction(mode):
     response = summary([sign('可读路', 'medium', 'front'),
                         sign('清晰路', 'high', 'right'), sign('模糊路', 'low')], mode)
-    assert [e.text for e in response.events] == (['清晰路'] if mode == 'read' else ['清晰路', '可读路'])
-    assert response.speech.key == 'sign:清晰路'
+    if mode == 'read':
+        assert [e.text for e in response.events] == ['清晰路']
+        assert response.speech.key == 'sign:清晰路'
+    else:
+        assert response.events == []
+        assert response.speech is None
 
 
-def test_equal_clarity_order_is_stable_and_details_keep_more_than_speech():
-    response = summary([sign(name) for name in ['甲路', '乙路', '丙路', '丁路']])
-    assert [e.text for e in response.events] == ['甲路', '乙路', '丙路', '丁路']
+def test_equal_clarity_order_is_stable_in_read_mode():
+    response = summary([sign(name) for name in ['甲路', '乙路', '丙路', '丁路']], 'read')
+    assert [e.text for e in response.events] == ['甲路']
 
 
 def test_sign_dedup_ignores_direction_and_clarity_and_normalizes_whitespace():
     response = summary([sign('  中山路\n 12号 ', 'medium', 'left'),
-                        sign('中山路 12号', 'high', 'right'), sign('中山路 12号', 'high')])
+                        sign('中山路 12号', 'high', 'right'), sign('中山路 12号', 'high')], 'read')
     assert len(response.events) == 1
     assert response.events[0].direction == 'right'
     assert response.events[0].clarity == 'high'
     assert response.speech.key == 'sign:中山路 12号'
-    assert summary([sign('中山路 12号', 'medium', 'unknown')]).speech.key == response.speech.key
+    assert summary([sign('中山路 12号', 'medium', 'unknown')], 'read').speech.key == response.speech.key
 
 
 def test_obstacle_dedup_still_distinguishes_direction():
@@ -149,10 +165,16 @@ def test_empty_or_oversized_sign_is_rejected(text):
         parse_result(json.dumps({'events': [sign(text)]}))
 
 
-@pytest.mark.parametrize('extra', [{'clarity': 'high'}, {'distance': 2}, {'confidence': 0.99}])
-def test_obstacles_cannot_supply_clarity_distance_or_confidence(extra):
+@pytest.mark.parametrize('extra', [{'clarity': 'high'}, {'distance': 2}])
+def test_obstacles_cannot_supply_clarity_or_distance(extra):
     with pytest.raises(VisionError, match='invalid_model_output'):
         parse_result(json.dumps({'events': [{**event('stairs'), **extra}]}))
+
+
+@pytest.mark.parametrize('raw,expected', [(0.99, 0.99), (0, 0.0), (1, 1.0), (None, None), (True, None), ('high', None), (-0.1, None), (1.2, None)])
+def test_confidence_is_kept_as_ratio_or_dropped(raw, expected):
+    result = parse_result(json.dumps({'events': [{**event('stairs'), 'confidence': raw}]}))
+    assert result.events[0].confidence == expected
 
 
 def test_obstacle_null_text_is_normalized_to_label():
@@ -173,6 +195,12 @@ def test_malformed_outputs_rejected(raw):
 
 def test_fenced_json_accepted():
     assert parse_result('```json\n{"events":[]}\n```').events == []
+
+
+def test_duplicated_field_opener_is_repaired():
+    raw = '{"events":[{"label":"person","direction":"front","box":[1,2,3,4],"confidence":0.9},{"label":"person","direction":"front","box":":[5,6,7,8],"confidence":0.8}]}'
+    result = parse_result(raw)
+    assert [list(e.box) for e in result.events] == [[1, 2, 3, 4], [5, 6, 7, 8]]
 
 
 def repeat_summary(events, recent, now, mode='walk', session='s', repeat_seconds=4.0, uncertain=False):
@@ -217,3 +245,84 @@ def test_read_unclear_speech_is_deduped_within_window():
     assert unclear(0.0).speech.key == 'unclear'
     assert unclear(1.0).speech is None
     assert unclear(4.2).speech.key == 'unclear'
+
+
+def test_far_obstacle_is_not_spoken_but_kept_in_details():
+    response = spatial_summary([obstacle('bicycle', proximity='far'),
+                                obstacle('bollard', proximity='near')])
+    assert [e.label for e in response.events] == ['bollard', 'bicycle']
+    assert response.speech.key == 'bollard:front:near'
+    assert response.speech.text == '前方发现路障'
+
+
+def test_far_person_with_unknown_confidence_is_also_silent():
+    response = spatial_summary([obstacle('person', proximity='far')])
+    assert response.events[0].label == 'person'
+    assert response.speech is None
+
+
+def test_low_confidence_low_risk_obstacle_is_not_spoken():
+    response = spatial_summary([obstacle('person', confidence=0.3)], min_confidence=0.5)
+    assert [e.label for e in response.events] == ['person']
+    assert response.speech is None
+
+
+def test_low_confidence_high_risk_is_spoken_as_hazy_warning():
+    response = spatial_summary([obstacle('stairs', confidence=0.3)], min_confidence=0.5)
+    assert response.speech.text == '前方疑似有楼梯，请留意'
+    assert response.speech.key == 'stairs:front'
+    assert response.speech.priority == 'high'
+
+
+def test_confident_detection_keeps_normal_wording():
+    response = spatial_summary([obstacle('person', confidence=0.9)], min_confidence=0.5)
+    assert response.speech.text == '前方发现行人'
+
+
+def test_confidence_floor_zero_disables_hazy_filtering():
+    response = spatial_summary([obstacle('person', confidence=0.1)], min_confidence=0.0)
+    assert response.speech.text == '前方发现行人'
+
+
+def continuous_summary(events, recent, now, repeat_seconds=4.0, continuous_repeat_seconds=12.0):
+    return summarize(AnalyzeInput(mode='walk', source='video', session_id='s', frame_id=3),
+                     VisionResult.model_validate({'events': events}), recent, now=now,
+                     repeat_seconds=repeat_seconds, continuous_repeat_seconds=continuous_repeat_seconds)
+
+
+def test_continuous_objects_use_wider_repeat_window():
+    recent = {}
+    assert continuous_summary([event('stairs')], recent, now=0.0).speech.text == '前方发现楼梯'
+    assert continuous_summary([event('stairs')], recent, now=5.0).speech is None
+    assert continuous_summary([event('stairs')], recent, now=13.0).speech.text == '前方发现楼梯'
+
+
+def test_point_hazards_keep_the_short_window():
+    recent = {}
+    assert continuous_summary([event('bollard')], recent, now=0.0).speech.text == '前方发现路障'
+    assert continuous_summary([event('bollard')], recent, now=5.0).speech.text == '前方发现路障'
+
+
+def test_arrow_and_symbol_noise_is_audited_out_of_sign_text():
+    response = summary([sign('→ 中山路12号 ↑')], 'read')
+    assert response.events[0].text == '中山路12号'
+    assert response.speech.key == 'sign:中山路12号'
+
+
+def test_gibberish_sign_text_is_dropped():
+    response = summary([sign('的的的'), sign('➤➤➤')], 'read')
+    assert response.events == []
+    assert response.status == 'uncertain'
+    assert response.speech.key == 'unclear'
+
+
+@pytest.mark.parametrize('mode', ['walk', 'read'])
+def test_symbol_only_sign_in_read_mode_becomes_unclear(mode):
+    response = summary([sign('➤ ➤ ➤')], mode)
+    assert response.events == []
+    if mode == 'read':
+        assert response.status == 'uncertain'
+        assert response.speech.key == 'unclear'
+    else:
+        assert response.status == 'ok'
+        assert response.speech is None

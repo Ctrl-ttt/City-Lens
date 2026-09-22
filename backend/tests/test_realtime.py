@@ -867,7 +867,7 @@ def test_ws_two_sources_use_in_memory_sanitized_jpegs(monkeypatch, caplog, sourc
 
 
 @pytest.mark.parametrize('scene', ['signs', 'obstacle', 'low', 'uncertain'])
-def test_ws_automatic_signs_use_rules_and_clean_up_each_turn(monkeypatch, caplog, scene):
+def test_ws_walk_turns_ignore_signs_and_obstacle_dedup_window(monkeypatch, caplog, scene):
     caplog.set_level(logging.INFO, logger='citylens')
     clock = SimpleNamespace(now=1024.0)
     monkeypatch.setattr(app_module, 'time', SimpleNamespace(monotonic=lambda: clock.now))
@@ -898,22 +898,16 @@ def test_ws_automatic_signs_use_rules_and_clean_up_each_turn(monkeypatch, caplog
                     assert result.events == [] and result.speech is None
                     assert result.status == ('uncertain' if scene == 'uncertain' else 'ok')
                 elif scene == 'obstacle':
-                    assert [e.label for e in result.events] == ['stairs', 'sign', 'sign']
+                    assert [e.label for e in result.events] == ['stairs']
                     if repeated:
-                        assert result.speech.key == 'sign:测试路 12号'
+                        assert result.speech is None
                     else:
                         assert result.speech.priority == 'high'
                         assert result.speech.text == '前方发现楼梯'
                 else:
-                    assert [e.text for e in result.events] == ['测试路 12号', '另一条路']
-                    assert result.events[0].clarity == 'high'
-                    assert result.events[0].direction == 'right'
-                    if repeated:
-                        assert result.speech.key == 'sign:另一条路'
-                    else:
-                        assert result.speech.key == 'sign:测试路 12号'
-                        assert result.speech.text == '标牌文字：测试路 12号'
-                        assert result.speech.priority == 'normal'
+                    # Walk never transcribes: sign-only frames stay empty and silent.
+                    assert result.events == [] and result.speech is None
+                    assert result.status == 'ok'
                 assert_no_secrets(message)
             disconnect_and_join(client, socket)
         assert_released(client)

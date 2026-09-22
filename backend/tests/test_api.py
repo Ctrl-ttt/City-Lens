@@ -99,9 +99,13 @@ def test_http_sign_contract_prompt_and_filtering(mode, clarity, caplog):
         response = analyze(client, mode)
         assert response.status_code == 200
         result = response.json()
-        if clarity == 'low':
+        if mode == 'walk':
+            assert result['status'] == 'ok'
             assert result['events'] == []
-            assert (result['speech']['key'] if result['speech'] else None) == (None if mode == 'walk' else 'unclear')
+            assert result['speech'] is None
+        elif clarity == 'low':
+            assert result['events'] == []
+            assert (result['speech']['key'] if result['speech'] else None) == 'unclear'
         else:
             assert result['status'] == 'ok'
             assert result['events'][0]['clarity'] == clarity
@@ -122,19 +126,34 @@ def test_http_mixed_scene_keeps_obstacle_priority_and_read_is_text_only(mode):
     with TestClient(create_app(Settings(api_key='test-only'), transport)) as client:
         result = analyze(client, mode).json()
     if mode == 'walk':
-        assert [e['text'] for e in result['events']] == ['楼梯', '出入口', '清晰标牌', '较小标牌']
-        assert result['speech']['priority'] == 'high'
+        assert [e['text'] for e in result['events']] == ['楼梯', '出入口']
+        assert result['speech'] == {'key': 'stairs:front', 'priority': 'high', 'text': '前方发现楼梯'}
     else:
         assert [e['text'] for e in result['events']] == ['清晰标牌']
         assert result['speech']['text'] == '标牌文字：清晰标牌'
 
 
-def test_walk_sign_sample_is_explicitly_labeled_as_sample():
+def test_read_mode_can_use_a_dedicated_stronger_model():
+    seen = []
+    def handler(request):
+        seen.append(json.loads(request.content)['model'])
+        return httpx.Response(200, json={'choices': [{'message': {'content': '{"events":[]}'}}]})
+    config = Settings(api_key='test-only', model='fast-model', read_model='strong-model')
+    with TestClient(create_app(config, httpx.MockTransport(handler))) as client:
+        assert analyze(client, 'walk').status_code == 200
+        assert analyze(client, 'read').status_code == 200
+    assert seen == ['fast-model', 'strong-model']
+
+
+def test_walk_sample_sign_is_never_read_without_read_mode():
     with TestClient(create_app(Settings(provider='sample', sample_scene='sign'))) as client:
         assert client.get('/api/health').json()['provider'] == 'sample'
-        result = analyze(client).json()
-        assert result['events'][0]['clarity'] == 'high'
-        assert result['speech']['text'].startswith('标牌文字：样例牌')
+        walk = analyze(client).json()
+        assert walk['events'] == []
+        assert walk['speech'] is None
+        read = analyze(client, 'read').json()
+        assert read['events'][0]['clarity'] == 'high'
+        assert read['speech']['text'].startswith('标牌文字：样例牌')
 
 
 def test_missing_configuration_never_falls_back_to_samples():

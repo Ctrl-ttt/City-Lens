@@ -39,6 +39,16 @@ class Observation(StrictModel):
     text: str = Field(default='', max_length=80)
     clarity: Literal['high', 'medium', 'low'] | None = None
     box: list[int] | None = None
+    confidence: float | None = None
+
+    @field_validator('confidence', mode='before')
+    @classmethod
+    def confidence_is_ratio_or_none(cls, value):
+        # Advisory self-reported certainty; malformed values drop the field, not the event.
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if 0.0 <= value <= 1.0 else None
 
     @field_validator('text', mode='before')
     @classmethod
