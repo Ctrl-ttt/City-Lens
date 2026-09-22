@@ -27,11 +27,48 @@ def test_priority_dedup_limit_keeps_obstacles_before_signs():
     assert response.speech.priority == 'high'
 
 
-def test_walk_automatically_reads_signs_before_facilities():
+def test_box_is_kept_as_normalized_ints():
+    result = parse_result(json.dumps({'events': [{**event('stairs'), 'box': [1.0, 2.4, 300, 400]}]}))
+    assert result.events[0].box == [1, 2, 300, 400]
+
+
+def test_malformed_box_is_dropped_not_rejected():
+    for box in (None, [1, 2, 3], [1, 2, 3, 'x'], [1, 2, 3, 4000], 'front', {'x1': 1}):
+        result = parse_result(json.dumps({'events': [{**event('stairs'), 'box': box}]}))
+        assert result.events[0].box is None
+    result = parse_result(json.dumps({'events': [dict(sign(), box=[63, 109, 342, 278])]}))
+    assert result.events[0].box == [63, 109, 342, 278]
+
+
+def test_escalator_is_a_facility_and_keeps_model_category():
+    result = parse_result(json.dumps({'events': [{**event('escalator', 'facility'), 'text': None}]}))
+    assert result.events[0].text == '自动扶梯'
+    with pytest.raises(VisionError, match='invalid_model_output'):
+        parse_result(json.dumps({'events': [event('escalator')]}))
+    response = summary([event('escalator', 'facility')])
+    assert response.speech.text == '前方发现自动扶梯'
+    assert response.speech.priority == 'low'
+
+
+def test_walk_ranks_facilities_before_signs_by_danger_priority():
     response = summary([event('entrance', 'facility'), sign()])
-    assert [e.label for e in response.events] == ['sign', 'entrance']
+    assert [e.label for e in response.events] == ['entrance', 'sign']
     assert response.speech.model_dump() == {
-        'key': 'sign:中山路', 'text': '标牌文字：中山路', 'priority': 'normal'}
+        'key': 'entrance:front', 'text': '前方发现出入口', 'priority': 'low'}
+
+
+def test_danger_tiers_order_steps_obstacles_facilities_then_signs():
+    response = summary([sign(), event('escalator', 'facility'),
+                        event('bicycle'), event('stairs')])
+    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'escalator']
+    assert response.speech.text == '前方发现楼梯'
+
+
+def test_collision_tier_orders_front_before_sides():
+    response = summary([event('barrier', direction='right'),
+                        event('bollard', direction='left'), event('bicycle')])
+    assert [(e.label, e.direction) for e in response.events] == [
+        ('bicycle', 'front'), ('bollard', 'left'), ('barrier', 'right')]
 
 
 @pytest.mark.parametrize('mode', ['walk', 'read'])
@@ -118,6 +155,16 @@ def test_obstacles_cannot_supply_clarity_distance_or_confidence(extra):
         parse_result(json.dumps({'events': [{**event('stairs'), **extra}]}))
 
 
+def test_obstacle_null_text_is_normalized_to_label():
+    result = parse_result(json.dumps({'events': [{**event('stairs'), 'text': None}]}))
+    assert result.events[0].text == '楼梯'
+
+
+def test_sign_with_null_text_is_rejected():
+    with pytest.raises(VisionError, match='invalid_model_output'):
+        parse_result(json.dumps({'events': [{**sign(), 'text': None}]}))
+
+
 @pytest.mark.parametrize('raw', ['```', '```json```', 'null', '[]', '{"events":[],"advice":"go"}', '{"events":[{"category":"facility","label":"bicycle","direction":"front"}]}'])
 def test_malformed_outputs_rejected(raw):
     with pytest.raises(VisionError, match='invalid_model_output'):
@@ -126,3 +173,47 @@ def test_malformed_outputs_rejected(raw):
 
 def test_fenced_json_accepted():
     assert parse_result('```json\n{"events":[]}\n```').events == []
+
+
+def repeat_summary(events, recent, now, mode='walk', session='s', repeat_seconds=4.0, uncertain=False):
+    return summarize(AnalyzeInput(mode=mode, source='video', session_id=session, frame_id=3),
+                     VisionResult.model_validate({'events': events, 'uncertain': uncertain}),
+                     recent, now=now, repeat_seconds=repeat_seconds)
+
+
+def test_repeat_speech_suppressed_within_window_and_recovers_at_boundary():
+    recent = {}
+    stairs = [event('stairs')]
+    assert repeat_summary(stairs, recent, now=100.0).speech.text == '前方发现楼梯'
+    suppressed = repeat_summary(stairs, recent, now=103.9)
+    assert suppressed.speech is None
+    assert [e.label for e in suppressed.events] == ['stairs']
+    assert repeat_summary(stairs, recent, now=104.0).speech.text == '前方发现楼梯'
+
+
+def test_repeat_suppression_tracks_speech_key_not_frame():
+    recent = {}
+    assert repeat_summary([event('stairs')], recent, now=0.0).speech is not None
+    different = repeat_summary([event('bicycle')], recent, now=1.0)
+    assert different.speech.text == '前方发现自行车'
+
+
+def test_repeat_suppression_is_per_session_dict():
+    first, second = {}, {}
+    assert repeat_summary([event('stairs')], first, now=0.0, session='sa').speech is not None
+    assert repeat_summary([event('stairs')], second, now=0.0, session='sb').speech is not None
+
+
+def test_repeat_suppression_disabled_when_window_is_zero():
+    recent = {}
+    assert repeat_summary([event('stairs')], recent, now=0.0, repeat_seconds=0).speech is not None
+    assert repeat_summary([event('stairs')], recent, now=1.0, repeat_seconds=0).speech is not None
+
+
+def test_read_unclear_speech_is_deduped_within_window():
+    recent = {}
+    def unclear(now):
+        return repeat_summary([], recent, now=now, mode='read', uncertain=True)
+    assert unclear(0.0).speech.key == 'unclear'
+    assert unclear(1.0).speech is None
+    assert unclear(4.2).speech.key == 'unclear'

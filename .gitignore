@@ -18,3 +18,4 @@ release/
 .DS_Store
 native/link2/build/
 
+test/

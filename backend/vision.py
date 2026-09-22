@@ -14,13 +14,14 @@ SYSTEM_PROMPT = '''你是 CityLens 的视觉观察模块，只报告当前图像
 不估计米数、不判断安全通行、不给导航动作、不推断看不见的物体。
 方向以不镜像的画面为准：left/front/right/unknown。整幅画面无法确认时 uncertain=true, events=[]。
 局部标牌模糊不应影响其它清晰的障碍或设施；省略看不清的标牌，不猜字。
-只输出 JSON：{"uncertain":false,"events":[{"category":"text","label":"sign","direction":"front","text":"中山路","clarity":"high"}]}。
+只输出 JSON：{"uncertain":false,"events":[{"category":"text","label":"sign","direction":"front","text":"中山路","clarity":"high","box":[63,109,342,278]}]}。
 允许标签及类别：obstacle: bicycle,barrier,bollard,step,stairs,obstacle；
-facility: crosswalk,elevator,entrance,bus_stop；text: sign。
-每项必须有 category,label,direction,text；text/sign 还必须有 clarity，其它类别不填 clarity 或填 null；不要加入其它字段。
+facility: crosswalk,elevator,escalator,entrance,bus_stop；text: sign。
+每项必须有 category,label,direction,text；text/sign 还必须有 clarity，其它类别不填 clarity 或填 null；
+每项给 "box":[x1,y1,x2,y2]，为 0-1000 归一化坐标（左上角原点），框住该项主体；定位不准可省略 box；不要加入其它字段。
 clarity 仅表示文字视觉清晰度：high=字形清晰完整，medium=字较小但所抄录文字仍完整可辨，low=模糊、缺字或不确定。
 只抄录 high/medium 的路牌、门牌、指示牌等主要文字，每块最多80字；不输出 low 标牌，不补全不可见字。
-按台阶/楼梯、其它障碍、high 标牌、medium 标牌、公共设施的顺序保留最多三个关键观察。同一文字只保留最清晰的一项。
+按台阶/楼梯、其它障碍、公共设施、high 标牌、medium 标牌的顺序保留最多三个关键观察。同一文字只保留最清晰的一项。
 清晰度不是距离或识别正确率，不按猜测距离排序。空场景返回 uncertain=false,events=[]。'''
 
 WALK_INSTRUCTION = '环境模式：自动读取清晰可辨的路牌等标牌文字，同时报告障碍物和公共设施；障碍优先，标牌按文字清晰度排序。'
@@ -43,6 +44,9 @@ class Settings:
     timeout: float = 8.0
     realtime_model: str = 'qwen3.5-omni-plus-realtime'
     realtime_url: str = ''
+    max_distance_m: float = 5.0
+    camera_hfov_deg: float = 75.0
+    speech_repeat_seconds: float = 4.0
 
     @property
     def realtime_endpoint(self):

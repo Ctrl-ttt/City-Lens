@@ -12,14 +12,14 @@ function setup() {
 }
 
 describe('SpeechQueue', () => {
-  it('suppresses repeats for 8 seconds, but permits manual replay', () => {
+  it('suppresses repeats for 4 seconds, but permits manual replay', () => {
     const t = setup();
     t.queue.offer(t.candidate('bike')); t.completions[0]();
-    t.tick(7999); t.queue.offer(t.candidate('bike'));
+    t.tick(3999); t.queue.offer(t.candidate('bike'));
     expect(t.driver.speak).toHaveBeenCalledTimes(1);
     t.queue.offer({ ...t.candidate('bike'), manual: true }); t.completions[1]();
     expect(t.driver.speak).toHaveBeenCalledTimes(2);
-    t.tick(15999); t.queue.offer(t.candidate('bike'));
+    t.tick(8000); t.queue.offer(t.candidate('bike'));
     expect(t.driver.speak).toHaveBeenCalledTimes(3);
   });
   it('interrupts low priority and ignores completion callbacks from cancelled speech', () => {
@@ -32,7 +32,7 @@ describe('SpeechQueue', () => {
     t.completions[1]();
     expect(t.driver.speak.mock.calls.map(c => c[0])).toEqual(['entrance', 'stairs', 'bus']);
   });
-  it('deduplicates normal sign content for exactly 8 seconds without suppressing a different sign', () => {
+  it('deduplicates normal sign content for exactly 4 seconds without suppressing a different sign', () => {
     const t = setup();
     const sign = (text: string): Candidate => ({ ...t.candidate(`sign:${text}`, 'normal'), text: `标牌文字：${text}` });
     t.queue.offer(sign('中山路 入口')); t.completions[0]();
@@ -40,9 +40,9 @@ describe('SpeechQueue', () => {
     expect(t.driver.speak).toHaveBeenCalledTimes(1);
     t.tick(2000); t.queue.offer(sign('测试路')); t.completions[1]();
     expect(t.driver.speak.mock.calls.map(c => c[0])).toEqual(['标牌文字：中山路 入口', '标牌文字：测试路']);
-    t.tick(7999); t.queue.offer(sign('中山路 入口'));
+    t.tick(3999); t.queue.offer(sign('中山路 入口'));
     expect(t.driver.speak).toHaveBeenCalledTimes(2);
-    t.tick(8000); t.queue.offer(sign('中山路 入口'));
+    t.tick(4000); t.queue.offer(sign('中山路 入口'));
     expect(t.driver.speak.mock.calls.map(c => c[0])).toEqual(['标牌文字：中山路 入口', '标牌文字：测试路', '标牌文字：中山路 入口']);
     expect(t.driver.cancel).not.toHaveBeenCalled();
   });

@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Mode = Literal['walk', 'read']
 Source = Literal['camera', 'video']
@@ -13,6 +13,7 @@ LABELS = {
     'obstacle': ('obstacle', '障碍物'),
     'crosswalk': ('facility', '斑马线'),
     'elevator': ('facility', '电梯入口'),
+    'escalator': ('facility', '自动扶梯'),
     'entrance': ('facility', '出入口'),
     'bus_stop': ('facility', '公交站'),
     'sign': ('text', '标牌'),
@@ -29,6 +30,27 @@ class Observation(StrictModel):
     direction: Literal['left', 'front', 'right', 'unknown']
     text: str = Field(default='', max_length=80)
     clarity: Literal['high', 'medium', 'low'] | None = None
+    box: list[int] | None = None
+
+    @field_validator('text', mode='before')
+    @classmethod
+    def null_text_becomes_empty(cls, value):
+        # Qwen-VL writes "text": null for obstacle/facility events even though the prompt asks for a string.
+        return '' if value is None else value
+
+    @field_validator('box', mode='before')
+    @classmethod
+    def box_is_normalized_or_dropped(cls, value):
+        # The model grounds in 0-1000 normalized coordinates; anything malformed loses the box, not the event.
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+        try:
+            coords = [round(float(item)) for item in value]
+        except (TypeError, ValueError):
+            return None
+        if any(item < 0 or item > 1000 for item in coords):
+            return None
+        return coords
 
     @model_validator(mode='after')
     def check_label(self):

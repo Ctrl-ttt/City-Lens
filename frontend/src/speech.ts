@@ -16,7 +16,7 @@ export class SpeechQueue {
   }
   offer(c: Candidate) {
     if (!this.valid(c)) return;
-    if (!c.manual && this.spoken.has(c.key) && this.now() - this.spoken.get(c.key)! < 8000) return;
+    if (!c.manual && this.spoken.has(c.key) && this.now() - this.spoken.get(c.key)! < 4000) return;
     if (this.current) {
       if (c.manual || rank[c.priority] > rank[this.current.priority]) this.cancelPlayback();
       else { this.pending = c; return; }
@@ -28,7 +28,7 @@ export class SpeechQueue {
     this.current = c;
     this.spoken.set(c.key, this.now());
     // Keep memory bounded on long OCR sessions.
-    for (const [key, time] of this.spoken) if (this.now() - time > 8000) this.spoken.delete(key);
+    for (const [key, time] of this.spoken) if (this.now() - time > 4000) this.spoken.delete(key);
     const generation = ++this.generation;
     this.driver.speak(c.text, () => {
       if (generation !== this.generation) return;

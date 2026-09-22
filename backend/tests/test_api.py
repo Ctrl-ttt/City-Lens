@@ -122,7 +122,7 @@ def test_http_mixed_scene_keeps_obstacle_priority_and_read_is_text_only(mode):
     with TestClient(create_app(Settings(api_key='test-only'), transport)) as client:
         result = analyze(client, mode).json()
     if mode == 'walk':
-        assert [e['text'] for e in result['events']] == ['楼梯', '清晰标牌', '较小标牌']
+        assert [e['text'] for e in result['events']] == ['楼梯', '出入口', '清晰标牌']
         assert result['speech']['priority'] == 'high'
     else:
         assert [e['text'] for e in result['events']] == ['清晰标牌']
@@ -186,3 +186,18 @@ def test_busy_request_is_not_queued():
             assert response.json()['error_code'] == 'busy'
         finally:
             client.portal.call(client.app.state.lock.release)
+
+
+def test_repeat_speech_suppressed_within_window_but_events_still_returned():
+    content = {'events': [{'category': 'obstacle', 'label': 'stairs',
+                           'direction': 'front', 'text': None}]}
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, json={'choices': [{'message': {'content': json.dumps(content)}}]}))
+    with TestClient(create_app(Settings(api_key='test-only'), transport)) as client:
+        first = analyze(client, source='video', frame_id='1').json()
+        second = analyze(client, source='video', frame_id='2').json()
+        other = analyze(client, source='video', session_id='other-session', frame_id='3').json()
+    assert first['speech']['text'] == '前方发现楼梯'
+    assert second['speech'] is None
+    assert [e['label'] for e in second['events']] == ['stairs']
+    assert other['speech']['text'] == '前方发现楼梯'

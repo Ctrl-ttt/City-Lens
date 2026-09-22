@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketState
 from .models import AnalyzeInput, AnalyzeResponse, RealtimeFrame
 from .link2 import camera_router
 from .realtime import MAX_FRAME_MESSAGE, realtime_session
+from .distance import filter_near_events
 from .rules import summarize
 from .vision import Settings, VisionError, observe
 
@@ -58,6 +59,13 @@ class MemoryParser(MultiPartParser):
     spool_max_size = MAX_BODY + 1
 
 
+def float_env(name, fallback):
+    try:
+        return float(os.getenv(name, ''))
+    except ValueError:
+        return fallback
+
+
 def load_settings():
     load_dotenv(ROOT / '.env', override=False)
     provider = os.getenv('CITYLENS_PROVIDER', 'live')
@@ -68,7 +76,10 @@ def load_settings():
                     model=os.getenv('DASHSCOPE_MODEL', Settings.model).strip(),
                     realtime_model=os.getenv('DASHSCOPE_REALTIME_MODEL', Settings.realtime_model).strip(),
                     realtime_url=os.getenv('DASHSCOPE_REALTIME_URL', '').strip(),
-                    sample_scene=os.getenv('CITYLENS_SAMPLE_SCENE', 'bicycle'))
+                    sample_scene=os.getenv('CITYLENS_SAMPLE_SCENE', 'bicycle'),
+                    max_distance_m=float_env('CITYLENS_MAX_DISTANCE_M', 5.0),
+                    camera_hfov_deg=float_env('CITYLENS_CAMERA_HFOV_DEG', 75.0),
+                    speech_repeat_seconds=float_env('CITYLENS_SPEECH_REPEAT_SECONDS', 4.0))
 
 
 def clean_jpeg(data: bytes, max_side=2048, quality=85) -> bytes:
@@ -87,6 +98,11 @@ def clean_jpeg(data: bytes, max_side=2048, quality=85) -> bytes:
         raise VisionError('invalid_input') from None
 
 
+def jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    with Image.open(io.BytesIO(data)) as im:
+        return im.size
+
+
 def create_app(settings: Settings | None = None, transport=None):
     config = settings or load_settings()
 
@@ -96,6 +112,7 @@ def create_app(settings: Settings | None = None, transport=None):
             app.state.client = client
             app.state.lock = asyncio.Lock()
             app.state.realtime_lock = asyncio.Lock()
+            app.state.speech_recent = {}
             yield
 
     app = FastAPI(title='CityLens', version='0.1.0', lifespan=lifespan)
@@ -178,6 +195,7 @@ def create_app(settings: Settings | None = None, transport=None):
                                 raise VisionError('realtime_idle') from None
                             if app.state.lock.locked():
                                 raise VisionError('busy')
+                            img_w, img_h = jpeg_dimensions(image)
                             generating = True
                             try:
                                 async with app.state.lock:
@@ -185,10 +203,12 @@ def create_app(settings: Settings | None = None, transport=None):
                             finally:
                                 generating = False
                                 del image
-                            response = summarize(frame, result)
+                            result.events, dropped = filter_near_events(result.events, img_w, img_h, config)
+                            recent = app.state.speech_recent.setdefault(frame.session_id, {})
+                            response = summarize(frame, result, recent, repeat_seconds=config.speech_repeat_seconds)
                             response.latency_ms = int((time.monotonic() - received_at) * 1000)
                             await socket.send_json({'type': 'result', **response.model_dump()})
-                            logger.info('realtime status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
+                            logger.info('realtime status=%s events=%s dropped_far=%s latency_ms=%s', response.status, len(response.events), dropped, response.latency_ms)
 
                 tasks = [asyncio.create_task(receive_frames()), asyncio.create_task(process_frames())]
                 try:
@@ -259,9 +279,12 @@ def create_app(settings: Settings | None = None, transport=None):
         try:
             async with app.state.lock:
                 result = await observe(image, meta.mode, config, app.state.client)
-            response = summarize(meta, result)
+            img_w, img_h = jpeg_dimensions(image)
+            result.events, dropped = filter_near_events(result.events, img_w, img_h, config)
+            recent = app.state.speech_recent.setdefault(meta.session_id, {})
+            response = summarize(meta, result, recent, repeat_seconds=config.speech_repeat_seconds)
             response.latency_ms = int((time.monotonic()-started)*1000)
-            logger.info('analyze status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
+            logger.info('analyze status=%s events=%s dropped_far=%s latency_ms=%s', response.status, len(response.events), dropped, response.latency_ms)
             return JSONResponse(response.model_dump(), headers={'Cache-Control':'no-store'})
         except VisionError as error:
             logger.warning('analyze error_code=%s', error.code)

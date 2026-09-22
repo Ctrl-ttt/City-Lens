@@ -846,7 +846,8 @@ def test_ws_two_sources_use_in_memory_sanitized_jpegs(monkeypatch, caplog, sourc
                 assert (result.session_id, result.frame_id) == ('realtime-test', number)
                 assert result.status == 'ok' and result.error_code is None
                 assert result.events[0].text == '自行车'
-                assert result.speech.text == '右前方发现自行车'
+                # 同一播报键两帧间隔 1 秒，落在 4 秒去重窗口内，第二帧不再播报
+                assert (result.speech is None) if number == 2 else (result.speech.text == '右前方发现自行车')
                 assert result.latency_ms >= 0
                 assert_no_secrets(message)
             disconnect_and_join(client, socket)
@@ -892,20 +893,27 @@ def test_ws_automatic_signs_use_rules_and_clean_up_each_turn(monkeypatch, caplog
                 assert message.pop('type') == 'result'
                 result = AnalyzeResponse.model_validate(message)
                 assert result.frame_id == number
+                repeated = number == 2  # 同一播报键间隔 1 秒，落在 4 秒去重窗口内
                 if scene in ('low', 'uncertain'):
                     assert result.events == [] and result.speech is None
                     assert result.status == ('uncertain' if scene == 'uncertain' else 'ok')
                 elif scene == 'obstacle':
                     assert [e.label for e in result.events] == ['stairs', 'sign', 'sign']
-                    assert result.speech.priority == 'high'
-                    assert result.speech.text == '前方发现楼梯'
+                    if repeated:
+                        assert result.speech is None
+                    else:
+                        assert result.speech.priority == 'high'
+                        assert result.speech.text == '前方发现楼梯'
                 else:
                     assert [e.text for e in result.events] == ['测试路 12号', '另一条路']
                     assert result.events[0].clarity == 'high'
                     assert result.events[0].direction == 'right'
-                    assert result.speech.key == 'sign:测试路 12号'
-                    assert result.speech.text == '标牌文字：测试路 12号'
-                    assert result.speech.priority == 'normal'
+                    if repeated:
+                        assert result.speech is None
+                    else:
+                        assert result.speech.key == 'sign:测试路 12号'
+                        assert result.speech.text == '标牌文字：测试路 12号'
+                        assert result.speech.priority == 'normal'
                 assert_no_secrets(message)
             disconnect_and_join(client, socket)
         assert_released(client)
