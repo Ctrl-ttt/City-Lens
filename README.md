@@ -105,6 +105,7 @@ API Key 只放后端，不能填入前端代码或提交仓库。不把密钥发
 - [ECS、OSS、RAM 与运行手册](docs/运维手册.md)
 - [架构决策记录](docs/架构决策记录.md)
 - [四人分工与交付检查表](docs/团队分工与交付检查表.md)
+- [访谈提纲](docs/访谈提纲.md)
 - [访谈、评测与人工验收模板](docs/验收记录.md)
 
 `frontend/pnpm-lock.yaml` 和 `backend/requirements.txt` 固定本次验证依赖。`backend/requirements.in` 用于有意更新依赖时重新解析，日常安装使用 `.txt`。
