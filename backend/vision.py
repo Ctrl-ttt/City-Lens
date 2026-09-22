@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import ValidationError
@@ -33,10 +34,27 @@ class Settings:
     model: str = 'qwen3-vl-plus'
     sample_scene: str = 'bicycle'
     timeout: float = 8.0
+    realtime_model: str = 'qwen3.5-omni-plus-realtime'
+    realtime_url: str = ''
+
+    @property
+    def realtime_endpoint(self):
+        parsed = urlsplit(self.realtime_url or self.base_url)
+        if parsed.scheme != ('wss' if self.realtime_url else 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            return ''
+        return urlunsplit(('wss', parsed.netloc, parsed.path if self.realtime_url else '/api-ws/v1/realtime', '', ''))
+
+    @property
+    def http_configured(self):
+        return self.provider == 'sample' or bool(self.api_key and self.base_url and self.model)
+
+    @property
+    def realtime_configured(self):
+        return self.provider != 'sample' and bool(self.api_key and self.realtime_endpoint and self.realtime_model)
 
     @property
     def configured(self):
-        return self.provider == 'sample' or bool(self.api_key and self.base_url and self.model)
+        return self.realtime_configured if self.provider == 'realtime' else self.http_configured
 
 
 def parse_result(content: str) -> VisionResult:
@@ -65,7 +83,7 @@ def sample_result(scene: str, mode: Mode) -> VisionResult:
 async def observe(image: bytes, mode: Mode, settings: Settings, client: httpx.AsyncClient) -> VisionResult:
     if settings.provider == 'sample':
         return sample_result(settings.sample_scene, mode)
-    if not settings.configured:
+    if not settings.http_configured:
         raise VisionError('not_configured')
     instruction = '环境模式：只报告障碍物和公共设施，不读取招牌。' if mode == 'walk' else '看牌模式：只读取一个主要标牌，不报告其它类别。'
     payload = {

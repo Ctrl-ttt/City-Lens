@@ -55,6 +55,12 @@ class AnalyzeInput(StrictModel):
     source: Source
 
 
+class RealtimeFrame(AnalyzeInput):
+    type: Literal['frame']
+    mode: Literal['walk']
+    image: str = Field(min_length=4, max_length=256 * 1024)
+
+
 class Speech(StrictModel):
     key: str
     priority: Literal['high', 'normal', 'low']

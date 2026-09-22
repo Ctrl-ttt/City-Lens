@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Accessibility, ALargeSmall, Camera, Contrast, FileVideo, Headphones, Info, Pause, Play, RotateCcw, ScanText, Square, Volume2, VolumeX } from 'lucide-react';
-import type { Analysis, Health, Mode, Source } from './types';
+import type { Analysis, Channel, Health, Mode, RealtimeState, Source } from './types';
 import { SessionGate } from './session';
 import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from './speech';
+import { captureRealtimeFrame, RealtimeClient } from './realtime';
 import cityLensMark from './assets/citylens-mark.svg';
 import './brand.css';
 
@@ -16,6 +17,12 @@ export default function App() {
   const gate = useRef(new SessionGate());
   const active = useRef(false);
   const sourceRef = useRef<Source>('camera');
+  const channelRef = useRef<Channel>('http');
+  const realtime = useRef<RealtimeClient | null>(null);
+  const healthRef = useRef<Health | null>(null);
+  const mounted = useRef(false);
+  const [channel, setChannel] = useState<Channel>('http');
+  const [connectionState, setConnectionState] = useState<RealtimeState>('waiting');
   const internalSeek = useRef(false);
   const queue = useRef<SpeechQueue | null>(null);
   const last = useRef<Candidate | null>(null);
@@ -50,16 +57,38 @@ export default function App() {
       const response = await fetch('/api/health', { signal: AbortSignal.timeout(4000) });
       if (!response.ok) throw new Error();
       const value: Health = await response.json();
-      if (!['live', 'sample'].includes(value.provider)) throw new Error();
-      setHealth(value); setHealthError('');
-    } catch { setHealth(null); setHealthError('后端未连接，请运行启动脚本后重新检查。'); }
+      if (!['live', 'sample', 'realtime'].includes(value.provider)) throw new Error();
+      if (!mounted.current) return;
+      if (!healthRef.current || healthRef.current.provider !== value.provider) {
+        invalidate();
+        const next = value.provider === 'realtime' ? 'realtime' : 'http';
+        channelRef.current = next; setChannel(next); setConnectionState('waiting');
+      }
+      healthRef.current = value; setHealth(value); setHealthError('');
+    } catch { if (mounted.current) { invalidate(); setHealth(null); setHealthError('后端未连接，请运行启动脚本后重新检查。'); } }
   }
 
-  function invalidate(message?: string) {
-    active.current = false; setRunning(false); setBusy(false);
-    gate.current.reset(); queue.current?.clear(); last.current = null;
+  function closeRealtime() {
+    const client = realtime.current;
+    realtime.current = null;
+    client?.close();
+    if (client) setConnectionState('disconnected');
+  }
+  function clearResults() {
+    queue.current?.clear(); last.current = null;
     setResult(null); setHistory([]); setRoundtrip(0);
+  }
+  function invalidate(message?: string) {
+    active.current = false; setRunning(false); setBusy(false); setConnecting(false);
+    closeRealtime(); gate.current.reset(); clearResults();
     if (message) setNotice(message);
+  }
+  function changeChannel(next: Channel) {
+    if (next === channelRef.current || health?.provider === 'sample') return;
+    invalidate('识别通道已切换，请重新开始');
+    if (sourceRef.current === 'video') video.current?.pause();
+    channelRef.current = next; setChannel(next); setMode('walk'); setError('');
+    setConnectionState('waiting');
   }
   function releaseCamera() {
     stream.current?.getTracks().forEach(t => { t.onended = null; t.stop(); });
@@ -84,16 +113,26 @@ export default function App() {
     else setError(message);
   }
 
+  // The timer and reconnect callbacks always see the current channel and state.
+  const analyzeRef = useRef(analyze);
+  analyzeRef.current = analyze;
   useEffect(() => {
+    const timer = setInterval(() => { if (active.current) void analyzeRef.current('walk'); }, channel === 'realtime' ? 1000 : 2000);
+    return () => clearInterval(timer);
+  }, [channel]);
+
+  useEffect(() => {
+    mounted.current = true;
     void checkHealth();
     const refreshVoices = () => { setVoiceName(chineseVoice()?.name ?? ''); };
     refreshVoices();
     window.speechSynthesis?.addEventListener('voiceschanged', refreshVoices);
     const onHidden = () => { if (document.hidden) invalidate('页面进入后台，识别已暂停'); };
     document.addEventListener('visibilitychange', onHidden);
-    const timer = setInterval(() => { if (active.current) void analyze('walk'); }, 2000);
     return () => {
-      clearInterval(timer); gate.current.reset(); queue.current?.clear(); releaseCamera();
+      mounted.current = false; active.current = false;
+      const client = realtime.current; realtime.current = null; client?.close();
+      gate.current.reset(); queue.current?.clear(); releaseCamera();
       if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
       document.removeEventListener('visibilitychange', onHidden);
       window.speechSynthesis?.removeEventListener('voiceschanged', refreshVoices);
@@ -112,17 +151,19 @@ export default function App() {
       media.getVideoTracks()[0].onended = () => { invalidate('摄像头已断开'); releaseCamera(); setReady(false); setError('请重新连接摄像头，然后开始识别。'); };
       video.current!.srcObject = media;
       await video.current!.play();
-      if (gate.current.session !== session) { releaseCamera(); return false; }
-      setDevices((await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'));
+      if (gate.current.session !== session) { if (stream.current === media) releaseCamera(); return false; }
+      const available = await navigator.mediaDevices.enumerateDevices();
+      if (gate.current.session !== session) return false;
+      setDevices(available.filter(d => d.kind === 'videoinput'));
       setReady(true); return true;
     } catch {
       if (gate.current.session === session) { releaseCamera(); setReady(false); setError('摄像头不可用：请允许浏览器访问，并检查 USB 连接及是否被其它软件占用。'); }
       return false;
-    } finally { setConnecting(false); }
+    } finally { if (gate.current.session === session) setConnecting(false); }
   }
 
   async function start(readMode = false, once = false) {
-    if (!consent || !health?.configured || connecting) return;
+    if (!consent || !(readMode ? httpConfigured : channelConfigured) || connecting || document.hidden) return;
     invalidate(); setError('');
     const requestedMode: Mode = readMode ? 'read' : 'walk';
     setMode(requestedMode);
@@ -142,42 +183,78 @@ export default function App() {
             element.addEventListener('seeked', done, { once: true });
             element.currentTime = 0;
           });
-        } catch { setError('视频无法回到开头，请重新选择文件。'); return; }
+        } catch { if (session === gate.current.session) setError('视频无法回到开头，请重新选择文件。'); return; }
         finally { internalSeek.current = false; }
       }
+      if (session !== gate.current.session) return;
       if (readMode || once || singleOnly) video.current.pause();
-      else { try { await video.current.play(); } catch { setError('视频无法播放，请检查视频格式。'); return; } }
+      else { try { await video.current.play(); } catch { if (session === gate.current.session) setError('视频无法播放，请检查视频格式。'); return; } }
     }
     if (session !== gate.current.session) return;
     active.current = !readMode && !once && !singleOnly;
     setRunning(active.current); setNotice(readMode ? '正在读取标牌' : '正在观察当前画面');
-    await analyze(requestedMode);
+    if (requestedMode === 'walk' && channelRef.current === 'realtime') {
+      const client = new RealtimeClient({
+        onState: state => { if (realtime.current === client) setConnectionState(state); },
+        onReady: () => {
+          if (realtime.current !== client) return;
+          setError(''); setNotice('已连接，正在观察新画面');
+          void analyzeRef.current('walk');
+        },
+        onDisconnect: (reason, retrying) => {
+          if (realtime.current !== client) return;
+          // Fence old frames and speech without cancelling this client's bounded recovery.
+          gate.current.reset(); clearResults(); setBusy(false);
+          setError(`${reason.message} 可切换 HTTP 抽帧后重新开始。`);
+          setNotice(retrying ? '实时连接恢复中，恢复后只分析新画面' : '实时连接已断开，请重新开始或切换 HTTP 抽帧');
+          if (!retrying) { active.current = false; setRunning(false); }
+        },
+      });
+      realtime.current = client;
+      client.start();
+    } else await analyze(requestedMode);
   }
 
   async function analyze(requestedMode: Mode) {
     const element = video.current;
-    if (!element || element.readyState < 2 || element.videoWidth === 0) return;
+    const useRealtime = requestedMode === 'walk' && channelRef.current === 'realtime';
+    const client = useRealtime ? realtime.current : null;
+    if (!element || element.readyState < 2 || element.videoWidth === 0 || document.hidden) {
+      if (client && !active.current) { closeRealtime(); setNotice('当前画面不可用，请重新开始'); }
+      return;
+    }
+    // Never acquire a ticket/capture an image before the backend's ready message.
+    if (useRealtime && !client?.isReady) return;
     const ticket = gate.current.acquire(Date.now());
     if (!ticket) return;
     setBusy(true);
     const maxAge = requestedMode === 'walk' ? 6000 : 8000;
-    const canvas = document.createElement('canvas');
-    const scale = Math.min(1, (requestedMode === 'read' ? 1280 : 960) / Math.max(element.videoWidth, element.videoHeight));
-    canvas.width = Math.round(element.videoWidth * scale); canvas.height = Math.round(element.videoHeight * scale);
+    let canvas: HTMLCanvasElement | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      canvas.getContext('2d')!.drawImage(element, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.75));
+      let data: Analysis;
+      if (client) {
+        const pending = client.send({ type: 'frame', session_id: ticket.session, frame_id: ticket.frame, mode: 'walk', source: sourceRef.current, image: captureRealtimeFrame(element) }, ticket.controller.signal);
+        if (!pending) return;
+        data = await pending;
+      } else {
+        canvas = document.createElement('canvas');
+        const scale = Math.min(1, (requestedMode === 'read' ? 1280 : 960) / Math.max(element.videoWidth, element.videoHeight));
+        canvas.width = Math.round(element.videoWidth * scale); canvas.height = Math.round(element.videoHeight * scale);
+        canvas.getContext('2d')!.drawImage(element, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise<Blob | null>(resolve => canvas!.toBlob(resolve, 'image/jpeg', 0.75));
+        if (!gate.current.current(ticket)) return;
+        if (!blob) throw new Error('无法读取当前画面，请重新选择输入。');
+        const form = new FormData();
+        form.append('image', blob, 'frame.jpg'); form.append('mode', requestedMode); form.append('source', sourceRef.current);
+        form.append('session_id', ticket.session); form.append('frame_id', String(ticket.frame));
+        timer = setTimeout(() => ticket.controller.abort(), 9000);
+        const response = await fetch('/api/analyze', { method: 'POST', body: form, signal: ticket.controller.signal });
+        data = await response.json();
+        if (!gate.current.current(ticket)) return;
+        if (!response.ok || data.status === 'error') throw new Error(data.message || '识别服务不可用，请稍后重试。');
+      }
       if (!gate.current.current(ticket)) return;
-      if (!blob) throw new Error('无法读取当前画面，请重新选择输入。');
-      const form = new FormData();
-      form.append('image', blob, 'frame.jpg'); form.append('mode', requestedMode); form.append('source', sourceRef.current);
-      form.append('session_id', ticket.session); form.append('frame_id', String(ticket.frame));
-      timer = setTimeout(() => ticket.controller.abort(), 9000);
-      const response = await fetch('/api/analyze', { method: 'POST', body: form, signal: ticket.controller.signal });
-      const data: Analysis = await response.json();
-      if (!gate.current.current(ticket)) return;
-      if (!response.ok || data.status === 'error') throw new Error(data.message || '识别服务不可用，请稍后重试。');
       if (data.session_id !== ticket.session || data.frame_id !== ticket.frame || !Array.isArray(data.events)) throw new Error('响应不匹配，请重新观察。');
       if (!gate.current.fresh(ticket, Date.now(), maxAge)) { failure('结果已过期，本次内容未播报。可切换按键识别。'); return; }
       gate.current.succeeded(); setError(''); setResult(data); setRoundtrip(Date.now()-ticket.capturedAt);
@@ -189,12 +266,17 @@ export default function App() {
       } else last.current = null;
     } catch (reason) {
       if (!gate.current.current(ticket)) return;
+      if (client) { closeRealtime(); active.current = false; setRunning(false); }
       failure(reason instanceof DOMException && reason.name === 'AbortError' ? '识别超时，请检查网络。' : reason instanceof Error ? reason.message : '识别失败，请重试。');
     } finally {
       if (timer) clearTimeout(timer);
-      canvas.width = canvas.height = 0;
+      if (canvas) canvas.width = canvas.height = 0;
       gate.current.finish(ticket);
-      if (gate.current.current(ticket)) setBusy(false);
+      if (gate.current.current(ticket)) {
+        setBusy(false);
+        // A keypress owns just one round; do not keep an idle, billable connection.
+        if (client && realtime.current === client && !active.current) closeRealtime();
+      }
     }
   }
 
@@ -215,14 +297,19 @@ export default function App() {
     setVoiceError('');
     queue.current?.offer({ key: 'voice-test', priority: 'normal', text: 'CityLens 中文语音测试。请确认可以听到这句话。', session: gate.current.session, capturedAt: Date.now(), maxAge: 8000, manual: true });
   }
-  const permitted = consent && !!health?.configured && !connecting;
+  const httpConfigured = !!health && health.http_configured;
+  const realtimeConfigured = !!health && health.provider !== 'sample' && health.realtime_configured;
+  const channelConfigured = channel === 'realtime' ? realtimeConfigured : httpConfigured;
+  const permitted = consent && channelConfigured && !connecting;
+  const connectionNames: Record<RealtimeState, string> = { waiting: '待连接', connecting: '连接中', connected: '已连接', recovering: '恢复中', disconnected: '已断开' };
+  const currentModel = health?.provider === 'sample' ? health.model : mode === 'read' || channel === 'http' ? health?.http_model : health?.realtime_model;
 
   return <div className={`shell ${largeText ? 'large-text' : ''} ${highContrast ? 'high-contrast' : ''}`}>
     <a className="skip" href="#controls">跳转到操作区</a>
     <header className="header">
       <a className="brand" href="#"><span className="lens-mark" aria-hidden="true"><img src={cityLensMark} alt=""/></span><span><strong>CityLens</strong><small>城市环境理解助手</small></span></a>
       <div className="header-tools" aria-label="显示设置">
-        <span className={`system-state ${health?.configured ? 'ready' : ''}`}><span aria-hidden="true"/>{health?.configured ? '服务已就绪' : '服务未就绪'}</span>
+        <span className={`system-state ${channelConfigured ? 'ready' : ''}`}><span aria-hidden="true"/>{channelConfigured ? '服务已就绪' : '服务未就绪'}</span>
         <button className="display-toggle" aria-pressed={largeText} onClick={() => setLargeText(value => !value)}><ALargeSmall aria-hidden="true"/>大字</button>
         <button className="display-toggle" aria-pressed={highContrast} onClick={() => setHighContrast(value => !value)}><Contrast aria-hidden="true"/>高对比</button>
       </div>
@@ -242,12 +329,13 @@ export default function App() {
         </div>
       </section>
       {health?.provider === 'sample' && <div className="banner sample" role="status"><strong>样例联调模式 · 不是实际识别</strong><span>结果来自固定样例，不分析输入画面；不会发送至云端。场景：{health.sample_scene}</span></div>}
-      {(healthError || (health && !health.configured)) && <div className="banner warning"><span>{healthError || '模型尚未配置。请在后端 .env 配置 API，再重新检查。'}</span><button onClick={() => void checkHealth()}>重新检查</button></div>}
+      {(healthError || (health && !channelConfigured)) && <div className="banner warning"><span>{healthError || '当前通道尚未配置，请切换已配置的通道或检查后重新开始。'}</span><button onClick={() => void checkHealth()}>重新检查</button></div>}
       <section className="control-card" id="controls" aria-labelledby="control-title">
         <div className="control-top"><div><p className="section-index">操作</p><h2 id="control-title">开始了解周围环境</h2></div><label className="switch-label"><input type="checkbox" checked={singleOnly} onChange={e => { invalidate('识别方式已切换'); setSingleOnly(e.target.checked); }}/><span>只用按键识别</span></label></div>
         <fieldset className="source-field"><legend>输入来源</legend><div className="source-tabs"><button aria-pressed={source==='camera'} onClick={() => changeSource('camera')}><Camera aria-hidden="true"/>实时摄像头</button><button aria-pressed={source==='video'} onClick={() => changeSource('video')}><FileVideo aria-hidden="true"/>路线视频回放</button></div></fieldset>
+        {health && health.provider !== 'sample' && <fieldset className="channel-field"><legend>识别通道</legend><div className="source-tabs"><button aria-pressed={channel==='realtime'} disabled={!realtimeConfigured} onClick={() => changeChannel('realtime')}>实时连接</button><button aria-pressed={channel==='http'} disabled={!httpConfigured} onClick={() => changeChannel('http')}>HTTP 抽帧</button></div><p className="quiet-note">{channel === 'realtime' ? '实时通道每秒尝试抽取一帧，忙碌时丢弃；仍是抽帧，不是连续安全导航。' : 'HTTP 通道每两秒尝试抽帧。'} 未使用麦克风；看牌始终使用 HTTP。</p>{channel === 'realtime' && <p className="connection-state" role="status" aria-label="实时连接状态">实时连接：{connectionNames[connectionState]}</p>}</fieldset>}
         <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
-        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : mode==='read' ? <><Play aria-hidden="true"/>▶ 返回环境识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!permitted || busy} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
+        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : mode==='read' ? <><Play aria-hidden="true"/>▶ 返回环境识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || (busy && (channel === 'http' || mode === 'read'))} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
       </section>
       <div className="workspace">
         <section className="camera-card" aria-label="画面输入">
@@ -262,11 +350,11 @@ export default function App() {
         <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 3 项</span></div>
           <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{directionNames[event.direction]}</span></div>)}</div>
           {!result?.events.length && <div className="empty-events"><Info aria-hidden="true"/><p>识别后，这里会列出当前画面中可确认的信息。</p></div>}
-          <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : '千问视觉模型'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
+          <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : mode === 'read' || channel === 'http' ? 'HTTP 抽帧' : '实时抽帧'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
           <p className="quiet-note">只提示当前画面中可确认的信息。没有提示，不代表前方安全。</p>
         </section>
       </div>
-      <section className="bottom-grid"><div className="voice-card"><div className="utility-icon" aria-hidden="true"><Headphones/></div><div><h2>语音输出</h2><p>{voiceName || '尚未检测到中文语音。请安装系统中文语音后重启浏览器。'}</p>{voiceError && <p role="alert" className="error">{voiceError}</p>}</div><button onClick={voiceTest} disabled={muted || running || busy}><Volume2 aria-hidden="true"/>测试中文语音</button></div><details className="debug"><summary>运行详情 <span>最近 5 次 · 仅本次会话</span></summary><p>服务：{health?.provider ?? '未连接'} · 模型：{health?.model ?? '—'}</p>{history.length===0 ? <p>尚无识别记录。</p> : history.map(r => <div className="debug-row" key={r.frame_id}>#{r.frame_id} · {r.status} · {r.latency_ms} ms · {r.events.length} 个观察</div>)}<p>不记录图片、密钥或 OCR 全文。</p></details></section>
+      <section className="bottom-grid"><div className="voice-card"><div className="utility-icon" aria-hidden="true"><Headphones/></div><div><h2>语音输出</h2><p>{voiceName || '尚未检测到中文语音。请安装系统中文语音后重启浏览器。'}</p>{voiceError && <p role="alert" className="error">{voiceError}</p>}</div><button onClick={voiceTest} disabled={muted || running || busy}><Volume2 aria-hidden="true"/>测试中文语音</button></div><details className="debug"><summary>运行详情 <span>最近 5 次 · 仅本次会话</span></summary><p>服务：{health?.provider ?? '未连接'} · 模型：{currentModel ?? '—'}</p>{history.length===0 ? <p>尚无识别记录。</p> : history.map(r => <div className="debug-row" key={r.frame_id}>#{r.frame_id} · {r.status} · {r.latency_ms} ms · {r.events.length} 个观察</div>)}<p>不记录图片、密钥或 OCR 全文。</p></details></section>
     </main><footer><span>CityLens · 环境理解辅助工具</span><span>不提供测距、通行判断或安全保证</span></footer>
   </div>;
 }
