@@ -401,6 +401,9 @@ label { display: block; font-size: var(--t-sm); font-weight: 600; }
 
 .source-tabs button svg { width: 18px; height: 18px; }
 
+.channel-field { margin-top: 20px; }
+.connection-state { margin-top: 8px; font-size: var(--t-sm); font-weight: 700; }
+
 .consent {
   margin-top: 20px;
   padding: 14px 18px;
