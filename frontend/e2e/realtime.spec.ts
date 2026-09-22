@@ -351,7 +351,7 @@ test('realtime capability is independent of an unconfigured HTTP default', async
   await expect(page.getByRole('button', { name: '看牌 · 读取文字' })).toBeDisabled();
 });
 
-test('read interrupts an in-flight realtime frame and uses HTTP without an idle socket', async ({ page }) => {
+test('read parks realtime over HTTP and resumes the stream automatically', async ({ page }) => {
   const { connections, http } = await setup(page, { results: false });
   await consentAndStart(page);
   await expect.poll(() => connections[0]?.frames.length).toBe(1);
@@ -359,19 +359,24 @@ test('read interrupts an in-flight realtime frame and uses HTTP without an idle 
   await page.getByRole('button', { name: '看牌 · 读取文字' }).click();
   await expect(caption(page)).toHaveText('标牌文字：测试路');
   await expect.poll(() => connections[0].closed).toBe(true);
-  await expect(state(page)).toHaveText('实时连接：已断开');
   expect(http).toEqual([{ mode: 'read', source: 'camera', closedBeforeHttp: true }]);
-  await page.clock.install(); await page.clock.runFor(10000);
-  expect(connections).toHaveLength(1);
-  await page.getByRole('button', { name: '▶ 返回环境识别' }).click();
-  await expect.poll(() => connections[1]?.frames.length).toBe(1);
+  // The read turn ends by itself; the same walk session resumes on a fresh socket.
+  await expect.poll(() => connections.length).toBe(2);
+  await expect(state(page)).toHaveText('实时连接：已连接');
+  await expect.poll(() => connections[1]?.frames.length).toBeGreaterThanOrEqual(1);
+  const resumed = connections[1].frames[0];
+  expect(resumed).toMatchObject({ mode: 'walk', source: 'camera' });
+  expect(resumed.session_id).toBe(old.session_id);
+  expect(resumed.frame_id).toBeGreaterThan(old.frame_id);
+  // The parked stream's in-flight frame and unsent frame ids never display or speak.
   respond(connections[1], old, '旧帧不得显示或播报');
-  respond(connections[1], { ...connections[1].frames[0], frame_id: 999 }, '错帧不得显示');
-  await page.clock.runFor(100);
+  respond(connections[1], { ...resumed, frame_id: 999 }, '错帧不得显示');
+  await page.waitForTimeout(100);
   expect(await page.evaluate(() => window.__spoken)).toEqual(['标牌文字：测试路']);
-  await expect(page.locator('.event-list')).toBeEmpty();
-  respond(connections[1], connections[1].frames[0], '新的当前画面');
+  await expect(page.locator('.event-list .event strong')).toHaveText(['测试路']);
+  respond(connections[1], resumed, '新的当前画面');
   await expect(caption(page)).toHaveText('新的当前画面');
+  expect(await page.evaluate(() => window.__spoken)).toEqual(['标牌文字：测试路', '新的当前画面']);
 });
 
 test.describe('automatic road sign OCR', () => {
@@ -485,7 +490,7 @@ test.describe('automatic road sign OCR', () => {
     });
   }
 
-  test('manual read repeats an automatic sign over HTTP and returns to realtime environment recognition', async ({ page }) => {
+  test('manual read repeats an automatic sign over HTTP and resumes realtime by itself', async ({ page }) => {
     const { connections, http, errors } = await setup(page, { results: false });
     await consentAndStart(page);
     await expect.poll(() => connections[0]?.frames.length).toBe(1);
@@ -496,25 +501,19 @@ test.describe('automatic road sign OCR', () => {
 
     await page.getByRole('button', { name: '看牌 · 读取文字' }).click();
     await expect(caption(page)).toHaveText('标牌文字：测试路');
-    await expect(page.locator('.mode-label')).toHaveText('看牌模式');
-    await expect(page.locator('.event-list .event strong')).toHaveText(['测试路']);
     await expect.poll(() => connections[0].closed).toBe(true);
-    await expect(state(page)).toHaveText('实时连接：已断开');
     expect(http).toEqual([{ mode: 'read', source: 'camera', closedBeforeHttp: true }]);
     expect(await page.evaluate(() => window.__spoken)).toEqual(['标牌文字：测试路', '标牌文字：测试路']);
-    await page.clock.runFor(5000);
-    expect(connections).toHaveLength(1);
-    expect(connections[0].frames).toHaveLength(1);
-    expect(http).toHaveLength(1);
-
-    await page.getByRole('button', { name: '▶ 返回环境识别' }).click();
-    await expect.poll(() => connections[1]?.frames.length).toBe(1);
+    // The read turn ends without a manual mode switch; walk resumes with the same session.
+    await expect.poll(() => connections.length).toBe(2);
+    await expect.poll(() => connections[1]?.frames.length).toBeGreaterThanOrEqual(1);
     const resumed = connections[1].frames[0];
     expect(resumed).toMatchObject({ mode: 'walk', source: 'camera' });
-    expect(resumed.session_id).not.toBe(old.session_id);
+    expect(resumed.session_id).toBe(old.session_id);
+    expect(resumed.frame_id).toBeGreaterThan(old.frame_id);
+    await expect(page.locator('.mode-label')).toHaveText('环境提示');
     await showResult(page, connections[1], signAnalysis(resumed, '中山路'));
     await expect(caption(page)).toHaveText('标牌文字：中山路');
-    await expect(page.locator('.mode-label')).toHaveText('环境提示');
     await expect(state(page)).toHaveText('实时连接：已连接');
     expect(await page.evaluate(() => window.__spoken)).toEqual(['标牌文字：测试路', '标牌文字：测试路', '标牌文字：中山路']);
     expect(http).toHaveLength(1);

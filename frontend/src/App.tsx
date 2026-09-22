@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Accessibility, ALargeSmall, Camera, Contrast, FileVideo, Headphones, Info, Pause, Play, RotateCcw, ScanText, Square, Volume2, VolumeX } from 'lucide-react';
 import type { Analysis, Channel, Health, Mode, Projection, RealtimeState, Source } from './types';
-import { SessionGate } from './session';
+import { SessionGate, HttpError } from './session';
 import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from './speech';
 import { captureRealtimeFrame, RealtimeClient } from './realtime';
 import cityLensMark from './assets/citylens-mark.svg';
@@ -32,7 +32,11 @@ export default function App() {
   const [source, setSource] = useState<Source>('camera');
   const [projection, setProjection] = useState<Projection>('rectilinear');
   const [heading, setHeading] = useState(0);
-  const [mode, setMode] = useState<Mode>('walk');
+  const [reading, setReading] = useState(false);
+  const readingRef = useRef(false);
+  const internalRead = useRef(false);
+  const cooldownUntil = useRef(0);
+  const scratch = useRef<HTMLCanvasElement | null>(null);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -94,7 +98,7 @@ export default function App() {
     if (next === channelRef.current || health?.provider === 'sample') return;
     invalidate('识别通道已切换，请重新开始');
     if (sourceRef.current === 'video') video.current?.pause();
-    channelRef.current = next; setChannel(next); setMode('walk'); setError('');
+    channelRef.current = next; setChannel(next); setError('');
     setConnectionState('waiting');
   }
   function releaseCamera() {
@@ -133,7 +137,9 @@ export default function App() {
   analyzeRef.current = analyze;
   useEffect(() => {
     // Poll readiness between send slots so encoding time cannot skip a whole second.
-    const timer = setInterval(() => { if (active.current) void analyzeRef.current('walk'); }, channel === 'realtime' ? 100 : 2000);
+    // A read turn parks this timer so an HTTP read cannot race the realtime lock.
+    // The rate-limit cooldown pauses walk rounds until the provider window clears.
+    const timer = setInterval(() => { if (active.current && !readingRef.current && Date.now() >= cooldownUntil.current) void analyzeRef.current('walk'); }, channel === 'realtime' ? 100 : 2000);
     return () => clearInterval(timer);
   }, [channel]);
 
@@ -199,83 +205,114 @@ export default function App() {
     await prepareCamera();
   }
 
+  function connectRealtime() {
+    const client = new RealtimeClient({
+      onState: state => { if (realtime.current === client) setConnectionState(state); },
+      onReady: () => {
+        if (realtime.current !== client) return;
+        setError('');
+        // A freshly spoken sign must stay on screen; the connection note never replaces a published result.
+        if (!last.current) setNotice('已连接，正在观察新画面');
+        void analyzeRef.current('walk');
+      },
+      onResult: (data, capturedAt) => {
+        if (realtime.current !== client || data.session_id !== gate.current.session) return;
+        setBusy(false);
+        publishResult(data, capturedAt, false);
+        // A keypress owns one analysis turn, not an idle, billable connection.
+        if (realtime.current === client && !active.current) closeRealtime();
+      },
+      onDisconnect: (reason, retrying) => {
+        if (realtime.current !== client) return;
+        // Fence old frames and speech without cancelling this client's bounded recovery.
+        gate.current.reset(); clearResults(); setBusy(false);
+        setError(`${reason.message} 可切换 HTTP 抽帧后重新开始。`);
+        setNotice(retrying ? '实时连接恢复中，恢复后只分析新画面' : '实时连接已断开，请重新开始或切换 HTTP 抽帧');
+        if (!retrying) { active.current = false; setRunning(false); }
+      },
+    });
+    realtime.current = client;
+    client.start();
+  }
+
   async function start(readMode = false, once = false) {
     if (!consent || !(readMode ? httpConfigured : channelConfigured) || connecting || cameraControlBusy || document.hidden) return;
-    invalidate(); setError('');
-    const requestedMode: Mode = readMode ? 'read' : 'walk';
-    setMode(requestedMode);
+    if (!readMode) { invalidate(); setError(''); cooldownUntil.current = 0; }
+    // A read turn is an independent signal: it never tears down the running walk stream.
     const session = gate.current.session;
-    if (sourceRef.current === 'camera' && !(await prepareCamera())) return;
-    if (session !== gate.current.session) return;
-    if (!video.current || video.current.readyState < 2) { setError('请先连接摄像头或选择可播放的 MP4 视频。'); return; }
-    if (sourceRef.current === 'video') {
-      if (video.current.ended) {
-        const element = video.current;
-        internalSeek.current = true;
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => { cleanup(); reject(new Error('seek timeout')); }, 3000);
-            const cleanup = () => { clearTimeout(timeout); element.removeEventListener('seeked', done); };
-            const done = () => { cleanup(); resolve(); };
-            element.addEventListener('seeked', done, { once: true });
-            element.currentTime = 0;
-          });
-        } catch { if (session === gate.current.session) setError('视频无法回到开头，请重新选择文件。'); return; }
-        finally { internalSeek.current = false; }
-      }
+    const wasRunning = readMode && active.current;
+    if (readMode) {
+      if (readingRef.current) return;
+      readingRef.current = true; setReading(true); setNotice('正在读取标牌'); internalRead.current = true;
+      // Park the realtime stream so the HTTP read turn does not race the backend lock.
+      closeRealtime();
+    }
+    const requestedMode: Mode = readMode ? 'read' : 'walk';
+    try {
+      if (sourceRef.current === 'camera' && !(await prepareCamera())) return;
       if (session !== gate.current.session) return;
-      if (readMode || once || singleOnly) {
-        const element = video.current;
-        // HAVE_CURRENT_DATA may precede the first usable decoded frame on Edge.
-        // Advance only an unstarted clip; subsequent keypresses keep its paused position.
-        if (element.currentTime === 0 && 'requestVideoFrameCallback' in element) {
+      if (!video.current || video.current.readyState < 2) { setError('请先连接摄像头或选择可播放的 MP4 视频。'); return; }
+      if (sourceRef.current === 'video') {
+        if (video.current.ended) {
+          const element = video.current;
+          internalSeek.current = true;
           try {
             await new Promise<void>((resolve, reject) => {
-              const timer = setTimeout(() => { element.cancelVideoFrameCallback(id); reject(new Error('frame timeout')); }, 3000);
-              const id = element.requestVideoFrameCallback(() => { clearTimeout(timer); resolve(); });
-              void element.play().catch(reason => { clearTimeout(timer); element.cancelVideoFrameCallback(id); reject(reason); });
+              const timeout = setTimeout(() => { cleanup(); reject(new Error('seek timeout')); }, 3000);
+              const cleanup = () => { clearTimeout(timeout); element.removeEventListener('seeked', done); };
+              const done = () => { cleanup(); resolve(); };
+              element.addEventListener('seeked', done, { once: true });
+              element.currentTime = 0;
             });
-          } catch { if (session === gate.current.session) setError('视频首帧尚未就绪，请播放后暂停再识别。'); return; }
-          finally { if (session === gate.current.session) element.pause(); }
-        } else element.pause();
+          } catch { if (session === gate.current.session) setError('视频无法回到开头，请重新选择文件。'); return; }
+          finally { internalSeek.current = false; }
+        }
+        if (session !== gate.current.session) return;
+        if (readMode || once || singleOnly) {
+          const element = video.current;
+          // HAVE_CURRENT_DATA may precede the first usable decoded frame on Edge.
+          // Advance only an unstarted clip; subsequent keypresses keep its paused position.
+          if (element.currentTime === 0 && 'requestVideoFrameCallback' in element) {
+            try {
+              await new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => { element.cancelVideoFrameCallback(id); reject(new Error('frame timeout')); }, 3000);
+                const id = element.requestVideoFrameCallback(() => { clearTimeout(timer); resolve(); });
+                void element.play().catch(reason => { clearTimeout(timer); element.cancelVideoFrameCallback(id); reject(reason); });
+              });
+            } catch { if (session === gate.current.session) setError('视频首帧尚未就绪，请播放后暂停再识别。'); return; }
+            finally { if (session === gate.current.session) element.pause(); }
+          } else element.pause();
+        }
+        else { try { await video.current.play(); } catch { if (session === gate.current.session) setError('视频无法播放，请检查视频格式。'); return; } }
       }
-      else { try { await video.current.play(); } catch { if (session === gate.current.session) setError('视频无法播放，请检查视频格式。'); return; } }
+      if (session !== gate.current.session) return;
+      if (!readMode) {
+        active.current = !once && !singleOnly;
+        setRunning(active.current); setNotice('正在观察当前画面');
+      }
+      if (!readMode && channelRef.current === 'realtime') {
+        connectRealtime();
+      } else await analyze(requestedMode);
+    } finally {
+      if (readMode) {
+        readingRef.current = false; setReading(false);
+        if (session !== gate.current.session) { internalRead.current = false; return; }
+        // Resume the parked walk stream where it left off.
+        if (wasRunning && active.current) {
+          if (sourceRef.current === 'video' && video.current) {
+            try { await video.current.play(); } catch { /* walk already reported its own errors */ }
+          }
+          if (channelRef.current === 'realtime' && !document.hidden) connectRealtime();
+        }
+        internalRead.current = false;
+      }
     }
-    if (session !== gate.current.session) return;
-    active.current = !readMode && !once && !singleOnly;
-    setRunning(active.current); setNotice(readMode ? '正在读取标牌' : '正在观察当前画面');
-    if (requestedMode === 'walk' && channelRef.current === 'realtime') {
-      const client = new RealtimeClient({
-        onState: state => { if (realtime.current === client) setConnectionState(state); },
-        onReady: () => {
-          if (realtime.current !== client) return;
-          setError(''); setNotice('已连接，正在观察新画面');
-          void analyzeRef.current('walk');
-        },
-        onResult: (data, capturedAt) => {
-          if (realtime.current !== client || data.session_id !== gate.current.session) return;
-          setBusy(false);
-          publishResult(data, capturedAt, false);
-          // A keypress owns one analysis turn, not an idle, billable connection.
-          if (realtime.current === client && !active.current) closeRealtime();
-        },
-        onDisconnect: (reason, retrying) => {
-          if (realtime.current !== client) return;
-          // Fence old frames and speech without cancelling this client's bounded recovery.
-          gate.current.reset(); clearResults(); setBusy(false);
-          setError(`${reason.message} 可切换 HTTP 抽帧后重新开始。`);
-          setNotice(retrying ? '实时连接恢复中，恢复后只分析新画面' : '实时连接已断开，请重新开始或切换 HTTP 抽帧');
-          if (!retrying) { active.current = false; setRunning(false); }
-        },
-      });
-      realtime.current = client;
-      client.start();
-    } else await analyze(requestedMode);
   }
 
   function publishResult(data: Analysis, capturedAt: number, manual: boolean) {
     if (data.session_id !== gate.current.session) return;
-    const maxAge = manual ? 8000 : 6000;
+    // Panorama rounds run 5-7 s by nature, so their freshness budget spans the abort window.
+    const maxAge = manual ? 8000 : projection === 'equirectangular' ? 9000 : 6000;
     if (Date.now() - capturedAt > maxAge) { failure('结果已过期，本次内容未播报。可切换按键识别。'); return; }
     gate.current.succeeded(); setError(''); setResult(data); setRoundtrip(Date.now() - capturedAt);
     setHistory(items => [data, ...items].slice(0, 5));
@@ -311,17 +348,28 @@ export default function App() {
     const ticket = gate.current.acquire(Date.now());
     if (!ticket) return;
     setBusy(true);
-    let canvas: HTMLCanvasElement | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      canvas = document.createElement('canvas');
+      const canvas = scratch.current ??= document.createElement('canvas');
       if (projection === 'equirectangular' && Math.abs(element.videoWidth / element.videoHeight - 2) > 0.04) throw new Error('请选择已拼接的 2:1 全景 MP4；双鱼眼原片不能直接识别。');
+      // Draw right after a presented frame so capture never contends with compositing.
+      if (!element.paused && 'requestVideoFrameCallback' in element) {
+        await new Promise<void>(resolve => {
+          const settle = () => resolve();
+          setTimeout(settle, 250);
+          element.requestVideoFrameCallback(settle);
+        });
+        if (!gate.current.current(ticket)) return;
+      }
       const scale = Math.min(1, (projection === 'equirectangular' ? 1920 : requestedMode === 'read' ? 1280 : 960) / Math.max(element.videoWidth, element.videoHeight));
-      canvas.width = Math.round(element.videoWidth * scale); canvas.height = Math.round(element.videoHeight * scale);
+      const width = Math.round(element.videoWidth * scale), height = Math.round(element.videoHeight * scale);
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
       const context = canvas.getContext('2d')!;
-      if (sourceRef.current === 'camera' && projection === 'rectilinear') context.setTransform(-1, 0, 0, 1, canvas.width, 0);
+      const flip = sourceRef.current === 'camera' && projection === 'rectilinear';
+      context.setTransform(flip ? -1 : 1, 0, 0, 1, flip ? canvas.width : 0, 0);
       context.drawImage(element, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise<Blob | null>(resolve => canvas!.toBlob(resolve, 'image/jpeg', 0.75));
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.75));
       if (!gate.current.current(ticket)) return;
       if (!blob) throw new Error('无法读取当前画面，请重新选择输入。');
       const form = new FormData();
@@ -332,15 +380,25 @@ export default function App() {
       const response = await fetch('/api/analyze', { method: 'POST', body: form, signal: ticket.controller.signal });
       const data: Analysis = await response.json();
       if (!gate.current.current(ticket)) return;
-      if (!response.ok || data.status === 'error') throw new Error(data.message || '识别服务不可用，请稍后重试。');
+      if (!response.ok || data.status === 'error')
+        throw new HttpError(data.error_code ?? String(response.status), data.message || '识别服务不可用，请稍后重试。');
       if (data.session_id !== ticket.session || data.frame_id !== ticket.frame || !Array.isArray(data.events)) throw new Error('响应不匹配，请重新观察。');
       publishResult(data, ticket.capturedAt, requestedMode === 'read');
     } catch (reason) {
       if (!gate.current.current(ticket)) return;
-      failure(reason instanceof DOMException && reason.name === 'AbortError' ? '识别超时，请检查网络。' : reason instanceof Error ? reason.message : '识别失败，请重试。');
+      const error = reason instanceof HttpError ? reason
+        : reason instanceof DOMException && reason.name === 'AbortError' ? new HttpError('model_timeout', '识别超时，请检查网络。')
+        : reason instanceof TypeError ? new HttpError('network_error', '无法连接识别服务，请检查网络。')
+        : reason instanceof Error ? reason : new Error('识别失败，请重试。');
+      if (error instanceof HttpError && error.transient) {
+        // Congestion and rate limits self-heal; keep the last result and keep trying.
+        if (error.code === 'rate_limited') { cooldownUntil.current = Date.now() + 15000; setError('模型请求过于频繁，已自动放慢节奏，稍后恢复。'); }
+        else if (error.code !== 'busy') setError(error.message);
+        return;
+      }
+      failure(error.message);
     } finally {
       if (timer) clearTimeout(timer);
-      if (canvas) canvas.width = canvas.height = 0;
       gate.current.finish(ticket);
       if (gate.current.current(ticket)) setBusy(false);
     }
@@ -368,7 +426,7 @@ export default function App() {
   const channelConfigured = channel === 'realtime' ? realtimeConfigured : httpConfigured;
   const permitted = consent && channelConfigured && !connecting && !cameraControlBusy;
   const connectionNames: Record<RealtimeState, string> = { waiting: '待连接', connecting: '连接中', connected: '已连接', recovering: '恢复中', disconnected: '已断开' };
-  const currentModel = health?.provider === 'sample' ? health.model : mode === 'read' || channel === 'http' ? health?.http_model : health?.realtime_model;
+  const currentModel = health?.provider === 'sample' ? health.model : reading || channel === 'http' ? health?.http_model : health?.realtime_model;
 
   return <div className={`shell ${largeText ? 'large-text' : ''} ${highContrast ? 'high-contrast' : ''}`}>
     <a className="skip" href="#controls">跳转到操作区</a>
@@ -383,8 +441,8 @@ export default function App() {
     <main>
       <section className={`now-panel ${error ? 'has-error' : ''}`} aria-labelledby="current-notice">
         <div className="now-heading">
-          <span className="mode-label"><Accessibility aria-hidden="true"/>{mode === 'walk' ? '环境提示' : '看牌模式'}</span>
-          <span className="activity-label">{connecting ? '正在连接输入' : busy ? '正在识别' : running ? '自动观察中' : '等待操作'}</span>
+          <span className="mode-label"><Accessibility aria-hidden="true"/>{reading ? '看牌模式' : '环境提示'}</span>
+          <span className="activity-label">{connecting ? '正在连接输入' : reading ? '正在读取标牌' : busy ? '正在识别' : running ? '自动观察中' : '等待操作'}</span>
         </div>
         <p className="now-kicker" id="current-notice">当前提示</p>
         <h1 className="live-caption" role="status" aria-live={muted || !voiceName ? 'polite' : 'off'}>{notice}</h1>
@@ -403,13 +461,13 @@ export default function App() {
         <fieldset className="source-field"><legend>画面格式</legend><label>输入格式 <select aria-label="画面格式" value={projection} onChange={e => changeProjection(e.target.value as Projection)}><option value="rectilinear">普通固定视角</option><option value="equirectangular">360° 全景（已拼接 2:1）</option></select></label>{projection === 'equirectangular' && <><p className="quiet-note">请使用 Insta360 Studio 导出的全景 MP4。HTTP 通道一次分析前、左、右、后、上、下六个方向；请保持相机朝向固定。原始 INSV 暂不直接播放。</p><label>正前方在全景中的角度：{heading}° <input aria-label="正前方角度" type="range" min="-180" max="180" step="15" value={heading} onChange={e => { invalidate('正前方已调整，请重新开始'); video.current?.pause(); setHeading(Number(e.target.value)); }}/></label><p className="quiet-note">0° 对应画面横向中央，+90° 对应画面右侧四分之三处；以路线前进方向校准。方向不随用户转头自动更新。</p></>}</fieldset>
         <p className="quiet-note">结合物体类型、方向和粗略远近选择提示，每次最多两项，优先前方并兼顾侧方和上方；后方疑似靠近需连续帧支持。远近仅辅助排序，不提供测距或通行判断。</p>
         <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
-        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : mode==='read' ? <><Play aria-hidden="true"/>▶ 返回环境识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || cameraControlBusy || (busy && (channel === 'http' || mode === 'read'))} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
+        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || cameraControlBusy || reading || (busy && channel === 'http')} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
       </section>
       <div className="workspace">
         <section className="camera-card" aria-label="画面输入">
           <div className="card-heading"><div><p className="section-index">画面</p><h2>观察窗口</h2></div><span className={`status ${running ? 'on' : ''}`}><i/>{connecting ? '连接中' : busy ? '识别中' : running ? '自动观察中' : '待命'}</span></div>
           <div className={`viewport ${ready ? 'has-video' : ''}`}>
-            <video ref={video} className={source === 'camera' && projection === 'rectilinear' ? 'camera-flipped' : undefined} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
+            <video ref={video} className={source === 'camera' && projection === 'rectilinear' ? 'camera-flipped' : undefined} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current && !internalRead.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
             {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true">{source === 'camera' ? <Camera/> : <FileVideo/>}</div><h3>{source==='camera' ? '摄像头尚未开启' : '尚未选择路线视频'}</h3><p>{source==='camera' ? '可先仅本地预览，确认画面后开始识别' : '选择本地 MP4 后开始识别'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
@@ -419,7 +477,7 @@ export default function App() {
         <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 6 项 · 播报最多 2 项</span></div>
           <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{directionNames[event.direction]}{event.approaching ? " · 疑似靠近" : ""}{event.proximity && event.proximity !== "unknown" ? ` · 粗估${{near:"较近",mid:"中距",far:"较远"}[event.proximity]}` : ""}</span></div>)}</div>
           {!result?.events.length && <div className="empty-events"><Info aria-hidden="true"/><p>识别后，这里会列出当前画面中可确认的信息。</p></div>}
-          <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : mode === 'read' || channel === 'http' ? 'HTTP 抽帧' : '实时连续帧流'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
+          <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : reading || channel === 'http' ? 'HTTP 抽帧' : '实时连续帧流'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
           <p className="quiet-note">只提示当前画面中可确认的信息。没有提示，不代表前方安全。</p>
         </section>
       </div>

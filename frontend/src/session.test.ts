@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SessionGate } from './session';
+import { SessionGate, HttpError, TRANSIENT_HTTP } from './session';
 
 describe('SessionGate', () => {
   it('skips frames while busy and increments frame IDs', () => {
@@ -28,5 +28,17 @@ describe('SessionGate', () => {
     expect([gate.failed(), gate.failed(), gate.failed()]).toEqual([false, false, true]);
     gate.succeeded();
     expect(gate.failed()).toBe(false);
+  });
+});
+
+describe('HttpError', () => {
+  it('marks congestion and provider hiccups transient so the walk loop keeps trying', () => {
+    for (const code of ['busy', 'rate_limited', 'network_error', 'model_timeout', 'model_unavailable'])
+      expect(new HttpError(code, '消息').transient).toBe(true);
+  });
+  it('counts setup and protocol failures toward the three-failure pause', () => {
+    for (const code of ['invalid_input', 'invalid_panorama', 'model_auth', 'not_configured', 'internal_error', '429'])
+      expect(new HttpError(code, '消息').transient).toBe(false);
+    expect(TRANSIENT_HTTP.has('busy')).toBe(true);
   });
 });
