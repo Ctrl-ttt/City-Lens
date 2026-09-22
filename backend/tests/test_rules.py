@@ -22,8 +22,8 @@ def summary(events, mode='walk', uncertain=False):
 def test_priority_dedup_limit_keeps_obstacles_before_signs():
     response = summary([sign(), event('bus_stop', 'facility'), event('bicycle'),
                         event('stairs'), event('stairs'), event('barrier')])
-    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'barrier']
-    assert response.speech.text == '前方发现楼梯'
+    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'barrier', 'bus_stop', 'sign']
+    assert response.speech.text == '前方发现楼梯；前方发现自行车'
     assert response.speech.priority == 'high'
 
 
@@ -60,15 +60,15 @@ def test_walk_ranks_facilities_before_signs_by_danger_priority():
 def test_danger_tiers_order_steps_obstacles_facilities_then_signs():
     response = summary([sign(), event('escalator', 'facility'),
                         event('bicycle'), event('stairs')])
-    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'escalator']
-    assert response.speech.text == '前方发现楼梯'
+    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'escalator', 'sign']
+    assert response.speech.text == '前方发现楼梯；前方发现自行车'
 
 
 def test_collision_tier_orders_front_before_sides():
     response = summary([event('barrier', direction='right'),
                         event('bollard', direction='left'), event('bicycle')])
     assert [(e.label, e.direction) for e in response.events] == [
-        ('bicycle', 'front'), ('bollard', 'left'), ('barrier', 'right')]
+        ('bicycle', 'front'), ('barrier', 'right'), ('bollard', 'left')]
 
 
 @pytest.mark.parametrize('mode', ['walk', 'read'])
@@ -79,9 +79,9 @@ def test_signs_are_sorted_by_clarity_not_input_order_or_direction(mode):
     assert response.speech.key == 'sign:清晰路'
 
 
-def test_equal_clarity_order_is_stable_and_walk_limit_is_three():
+def test_equal_clarity_order_is_stable_and_details_keep_more_than_speech():
     response = summary([sign(name) for name in ['甲路', '乙路', '丙路', '丁路']])
-    assert [e.text for e in response.events] == ['甲路', '乙路', '丙路']
+    assert [e.text for e in response.events] == ['甲路', '乙路', '丙路', '丁路']
 
 
 def test_sign_dedup_ignores_direction_and_clarity_and_normalizes_whitespace():

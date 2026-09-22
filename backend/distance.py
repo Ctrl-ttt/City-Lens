@@ -6,6 +6,9 @@ from .vision import Settings
 # 各类别主体的粗略标称实际高度（米），用于针孔模型的视尺寸距离估算。
 # 估算误差可达数倍：真实尺寸分布宽、框本身有误差、变焦会改变等效焦距。
 TYPICAL_HEIGHT_M = {
+    'person': 1.65,
+    'car': 1.5,
+    'motorcycle': 1.1,
     'step': 0.15,
     'stairs': 1.2,
     'bicycle': 1.0,
@@ -31,6 +34,20 @@ def estimate_distance_m(event: Observation, img_w: int, img_h: int, hfov_deg: fl
         return None
     focal_px = img_w / (2 * math.tan(math.radians(hfov_deg) / 2))
     return TYPICAL_HEIGHT_M[event.label] * focal_px / box_h_px
+
+
+def estimate_person_width_m(event: Observation, hfov_deg: float) -> float | None:
+    """Fallback for vertically clipped people with fully visible horizontal extent.
+
+    0.5 m is a nominal body-width assumption, not measured anthropometry or depth.
+    Pose and clothing can make it wrong; use only coarse ranking, never spoken metres.
+    """
+    if event.label != 'person' or not event.box or not 0 < hfov_deg < 170:
+        return None
+    x1, _y1, x2, _y2 = event.box
+    if x1 <= 5 or x2 >= 995 or x2 <= x1:
+        return None
+    return 0.5 / (2 * math.tan(math.radians(hfov_deg)/2) * ((x2-x1)/1000))
 
 
 def filter_near_events(events: list[Observation], img_w: int, img_h: int, settings: Settings):

@@ -107,7 +107,7 @@ test('pending control pauses recognition, clears guidance and blocks restarting 
   await expect(panel(page).getByRole('button', { name: '云台回正' })).toBeEnabled();
   await page.getByRole('checkbox', { name: /我了解当前/ }).check();
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现自行车');
   await panel(page).getByRole('button', { name: '云台回正' }).click();
   await expect.poll(() => commands.filter(c => c.action === 'ptz').length).toBe(1);
   await expect(page.locator('.event-list')).toBeEmpty();
@@ -120,7 +120,7 @@ test('pending control pauses recognition, clears guidance and blocks restarting 
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeEnabled();
   await expect(page.locator('.live-caption')).toContainText('识别已暂停');
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现自行车');
 });
 
 test('SDK missing or disconnected does not break USB preview or sample recognition', async ({ page }) => {
@@ -131,7 +131,7 @@ test('SDK missing or disconnected does not break USB preview or sample recogniti
   await expect.poll(() => page.locator('video').evaluate(v => (v as HTMLVideoElement).readyState)).toBeGreaterThanOrEqual(2);
   await page.getByRole('checkbox', { name: /我了解当前/ }).check();
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现自行车');
 });
 
 for (const variant of ['other-camera', 'multiple-browser', 'multiple-sdk', 'no-device'] as const) {

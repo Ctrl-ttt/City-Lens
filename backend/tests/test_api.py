@@ -33,7 +33,7 @@ def test_sample_contract_and_health():
         assert response.headers['cache-control'] == 'no-store'
         result = response.json()
         assert (result['session_id'], result['frame_id']) == ('test-session', 1)
-        assert result['speech']['text'] == '右前方发现自行车'
+        assert result['speech']['text'] == '右侧发现自行车'
         assert result['speech']['priority'] == 'high'
         assert analyze(client, 'read').json()['speech']['text'].startswith('标牌文字：样例牌')
 
@@ -78,7 +78,7 @@ def test_live_adapter_sends_image_and_uses_validated_rules():
         content = {'events': [{'category': 'obstacle', 'label': 'bicycle', 'direction': 'left', 'text': '现在可以过马路'}]}
         return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(content)}}]})
     with TestClient(create_app(Settings(api_key='test-only'), httpx.MockTransport(handler))) as client:
-        assert analyze(client).json()['speech']['text'] == '左前方发现自行车'
+        assert analyze(client).json()['speech']['text'] == '左侧发现自行车'
 
 
 @pytest.mark.parametrize('mode', ['walk', 'read'])
@@ -122,7 +122,7 @@ def test_http_mixed_scene_keeps_obstacle_priority_and_read_is_text_only(mode):
     with TestClient(create_app(Settings(api_key='test-only'), transport)) as client:
         result = analyze(client, mode).json()
     if mode == 'walk':
-        assert [e['text'] for e in result['events']] == ['楼梯', '出入口', '清晰标牌']
+        assert [e['text'] for e in result['events']] == ['楼梯', '出入口', '清晰标牌', '较小标牌']
         assert result['speech']['priority'] == 'high'
     else:
         assert [e['text'] for e in result['events']] == ['清晰标牌']

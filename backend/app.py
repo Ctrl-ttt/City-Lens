@@ -23,7 +23,8 @@ from starlette.websockets import WebSocketState
 from .models import AnalyzeInput, AnalyzeResponse, RealtimeFrame
 from .link2 import camera_router
 from .realtime import MAX_FRAME_MESSAGE, realtime_session
-from .distance import filter_near_events
+from .panorama import prepare_panorama
+from .spatial import SpatialSessions
 from .rules import summarize
 from .vision import Settings, VisionError, observe
 
@@ -42,6 +43,8 @@ MESSAGES = {
     'network_error': '无法连接模型服务，请检查网络。',
     'invalid_model_output': '本次识别结果无法确认，请重新观察。',
     'invalid_input': '请输入有效的 JPEG 图片和请求参数。',
+    'invalid_panorama': '全景输入需要已拼接的 2:1 全景图，原始双鱼眼 INSV 请先用 Insta360 Studio 导出。',
+    'panorama_http_only': '360° 全景请使用 HTTP 抽帧通道。',
     'image_too_large': '图片不能超过 2 MB。',
     'busy': '上一帧仍在识别，请稍后再试。',
     'forbidden_origin': '此服务仅供本地页面使用。',
@@ -112,7 +115,7 @@ def create_app(settings: Settings | None = None, transport=None):
             app.state.client = client
             app.state.lock = asyncio.Lock()
             app.state.realtime_lock = asyncio.Lock()
-            app.state.speech_recent = {}
+            app.state.spatial = SpatialSessions()
             yield
 
     app = FastAPI(title='CityLens', version='0.1.0', lifespan=lifespan)
@@ -162,6 +165,8 @@ def create_app(settings: Settings | None = None, transport=None):
                         if text is None or len(text) > MAX_FRAME_MESSAGE:
                             raise VisionError('invalid_input')
                         frame = RealtimeFrame.model_validate_json(text)
+                        if frame.projection != 'rectilinear':
+                            raise VisionError('panorama_http_only')
                         if not ready or (app.state.lock.locked() and not generating):
                             raise VisionError('busy')
                         if (session_id is not None and (frame.session_id != session_id or frame.source != source)) or frame.frame_id <= frame_id:
@@ -203,12 +208,11 @@ def create_app(settings: Settings | None = None, transport=None):
                             finally:
                                 generating = False
                                 del image
-                            result.events, dropped = filter_near_events(result.events, img_w, img_h, config)
-                            recent = app.state.speech_recent.setdefault(frame.session_id, {})
-                            response = summarize(frame, result, recent, repeat_seconds=config.speech_repeat_seconds)
+                            spatial, recent = app.state.spatial.process(frame, result, img_w, img_h, config, received_at)
+                            response = summarize(frame, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial)
                             response.latency_ms = int((time.monotonic() - received_at) * 1000)
                             await socket.send_json({'type': 'result', **response.model_dump()})
-                            logger.info('realtime status=%s events=%s dropped_far=%s latency_ms=%s', response.status, len(response.events), dropped, response.latency_ms)
+                            logger.info('realtime status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
 
                 tasks = [asyncio.create_task(receive_frames()), asyncio.create_task(process_frames())]
                 try:
@@ -255,11 +259,13 @@ def create_app(settings: Settings | None = None, transport=None):
                 yield chunk
         form = None
         try:
-            parser = MemoryParser(request.headers, bounded_stream(), max_files=1, max_fields=5, max_part_size=1024)
+            parser = MemoryParser(request.headers, bounded_stream(), max_files=1, max_fields=7, max_part_size=1024)
             form = await parser.parse()
-            if set(form.keys()) != {'image', 'mode', 'source', 'session_id', 'frame_id'} or len(form.multi_items()) != 5:
+            required = {'image', 'mode', 'source', 'session_id', 'frame_id'}
+            allowed = required | {'projection', 'heading_deg'}
+            if not required <= set(form.keys()) <= allowed or len(form.multi_items()) != len(form.keys()):
                 raise VisionError('invalid_input')
-            meta = AnalyzeInput.model_validate({k: form[k] for k in ('mode','source','session_id','frame_id')})
+            meta = AnalyzeInput.model_validate({k: form[k] for k in allowed - {'image'} if k in form})
             upload = form['image']
             if not isinstance(upload, UploadFile) or upload.content_type != 'image/jpeg':
                 raise VisionError('invalid_input')
@@ -278,13 +284,16 @@ def create_app(settings: Settings | None = None, transport=None):
             return fail('busy', 429)
         try:
             async with app.state.lock:
-                result = await observe(image, meta.mode, config, app.state.client)
+                if meta.projection == 'equirectangular':
+                    prepared = await asyncio.to_thread(prepare_panorama, image, meta)
+                    result = await observe(prepared, meta.mode, config, app.state.client, panorama=True)
+                else:
+                    result = await observe(image, meta.mode, config, app.state.client)
             img_w, img_h = jpeg_dimensions(image)
-            result.events, dropped = filter_near_events(result.events, img_w, img_h, config)
-            recent = app.state.speech_recent.setdefault(meta.session_id, {})
-            response = summarize(meta, result, recent, repeat_seconds=config.speech_repeat_seconds)
+            spatial, recent = app.state.spatial.process(meta, result, img_w, img_h, config, started)
+            response = summarize(meta, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial)
             response.latency_ms = int((time.monotonic()-started)*1000)
-            logger.info('analyze status=%s events=%s dropped_far=%s latency_ms=%s', response.status, len(response.events), dropped, response.latency_ms)
+            logger.info('analyze status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
             return JSONResponse(response.model_dump(), headers={'Cache-Control':'no-store'})
         except VisionError as error:
             logger.warning('analyze error_code=%s', error.code)

@@ -176,7 +176,7 @@ class QueueServer:
             assert session['modalities'] == ['text']
             assert session['turn_detection'] is None
             assert session['input_audio_format'] == 'pcm16'
-            assert session['max_response_output_tokens'] == 450
+            assert session['max_response_output_tokens'] == 1200
             assert '最新图像' in session['instructions']
             assert realtime_module.WALK_INSTRUCTION in session['instructions']
             assert 'clarity' in session['instructions']
@@ -847,7 +847,7 @@ def test_ws_two_sources_use_in_memory_sanitized_jpegs(monkeypatch, caplog, sourc
                 assert result.status == 'ok' and result.error_code is None
                 assert result.events[0].text == '自行车'
                 # 同一播报键两帧间隔 1 秒，落在 4 秒去重窗口内，第二帧不再播报
-                assert (result.speech is None) if number == 2 else (result.speech.text == '右前方发现自行车')
+                assert (result.speech is None) if number == 2 else (result.speech.text == '右侧发现自行车')
                 assert result.latency_ms >= 0
                 assert_no_secrets(message)
             disconnect_and_join(client, socket)
@@ -900,7 +900,7 @@ def test_ws_automatic_signs_use_rules_and_clean_up_each_turn(monkeypatch, caplog
                 elif scene == 'obstacle':
                     assert [e.label for e in result.events] == ['stairs', 'sign', 'sign']
                     if repeated:
-                        assert result.speech is None
+                        assert result.speech.key == 'sign:测试路 12号'
                     else:
                         assert result.speech.priority == 'high'
                         assert result.speech.text == '前方发现楼梯'
@@ -909,7 +909,7 @@ def test_ws_automatic_signs_use_rules_and_clean_up_each_turn(monkeypatch, caplog
                     assert result.events[0].clarity == 'high'
                     assert result.events[0].direction == 'right'
                     if repeated:
-                        assert result.speech is None
+                        assert result.speech.key == 'sign:另一条路'
                     else:
                         assert result.speech.key == 'sign:测试路 12号'
                         assert result.speech.text == '标牌文字：测试路 12号'

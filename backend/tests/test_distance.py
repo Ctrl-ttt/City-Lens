@@ -107,7 +107,7 @@ def test_invalid_fov_yields_no_estimate_and_keeps_event():
     assert estimate_distance_m(event, IMG_W, IMG_H, 180) is None
 
 
-def test_http_channel_drops_far_events_before_rules():
+def test_http_channel_keeps_far_event_in_details_but_prioritizes_nearer_hazard():
     content = {'events': [
         {'category': 'obstacle', 'label': 'bicycle', 'direction': 'left', 'text': '',
          'box': box_for_distance('bicycle', 30.0)},   # 小图下必然超 5m
@@ -122,5 +122,5 @@ def test_http_channel_drops_far_events_before_rules():
         response = client.post('/api/analyze', data=dict(mode='walk', source='video',
                                     session_id='s', frame_id='1'), files={'image': ('f.jpg', output.getvalue(), 'image/jpeg')})
     result = response.json()
-    assert [e['label'] for e in result['events']] == ['stairs']
+    assert [e['label'] for e in result['events']] == ['stairs', 'bicycle']
     assert result['speech']['text'] == '前方发现楼梯'

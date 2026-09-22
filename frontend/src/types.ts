@@ -1,7 +1,8 @@
 export type Mode = 'walk' | 'read';
 export type Source = 'camera' | 'video';
-export type Event = { category: 'obstacle' | 'facility' | 'text'; label: string; direction: 'left' | 'front' | 'right' | 'unknown'; text: string; clarity?: 'high' | 'medium' | 'low' | null };
-export type Speech = { key: string; priority: 'high' | 'normal' | 'low'; text: string };
+export type Projection = 'rectilinear' | 'equirectangular';
+export type Event = { category: 'obstacle' | 'facility' | 'text'; label: string; direction: 'left' | 'front' | 'right' | 'back' | 'above' | 'unknown'; text: string; clarity?: 'high' | 'medium' | 'low' | null; proximity?: 'near' | 'mid' | 'far' | 'unknown'; approaching?: boolean };
+export type Speech = { key: string; priority: 'urgent' | 'high' | 'normal' | 'low'; text: string };
 export type Analysis = { session_id: string; frame_id: number; status: 'ok' | 'uncertain' | 'error'; events: Event[]; speech: Speech | null; latency_ms: number; error_code?: string; message?: string };
 export type Channel = 'http' | 'realtime';
 export type Health = {
