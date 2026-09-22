@@ -15,4 +15,5 @@ work/
 release/
 *.log
 .DS_Store
+native/link2/build/
 

@@ -7,12 +7,13 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
-from .vision import SYSTEM_PROMPT, Settings, VisionError, parse_result
+from .vision import SYSTEM_PROMPT, WALK_INSTRUCTION, Settings, VisionError, parse_result
 
 MAX_ENCODED_IMAGE = 256 * 1024
 MAX_FRAME_MESSAGE = MAX_ENCODED_IMAGE + 2048
 SILENCE = base64.b64encode(bytes(6400)).decode('ascii')
-INSTRUCTIONS = SYSTEM_PROMPT + '\n环境模式：只报告障碍物和公共设施，不读取招牌。仅分析这一轮最新图像，不沿用历史观察。输入音频为合成静音，不是用户说话。'
+FRAME_AUDIO = base64.b64encode(bytes(32000)).decode('ascii')
+INSTRUCTIONS = SYSTEM_PROMPT + '\n' + WALK_INSTRUCTION + '仅报告本轮最新图像中仍可确认的事实，不沿用更早图像或历史回复中的标牌和障碍。输入音频为合成静音，不是用户说话。'
 
 
 class DirectConnect(connect):
@@ -52,6 +53,7 @@ class RealtimeVision:
     async def initialize(self):
         async with asyncio.timeout(self.settings.timeout):
             await self.send('session.update', session={
+                # VAD discards silent PCM; manual input must stop during generation.
                 'modalities': ['text'], 'turn_detection': None,
                 'instructions': INSTRUCTIONS, 'input_audio_format': 'pcm16',
                 'max_response_output_tokens': 450,
@@ -64,9 +66,9 @@ class RealtimeVision:
         if len(encoded) > MAX_ENCODED_IMAGE:
             raise VisionError('realtime_image_too_large')
         async with asyncio.timeout(self.settings.timeout):
-            # Each audio commit submits this frame; no microphone audio is collected.
             await self.send('input_audio_buffer.append', audio=SILENCE)
             await self.send('input_image_buffer.append', image=encoded)
+            await self.send('input_audio_buffer.append', audio=FRAME_AUDIO)
             await self.send('input_audio_buffer.commit')
             await self.send('response.create')
             text = ''
@@ -102,7 +104,6 @@ class RealtimeVision:
                     if result.model_fields_set != {'uncertain', 'events'}:
                         raise VisionError('invalid_model_output')
                     break
-            # Old images must not influence future observations or grow session context.
             for item_id in items:
                 await self.send('conversation.item.delete', item_id=item_id)
             while items:

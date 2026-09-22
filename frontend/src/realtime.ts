@@ -17,7 +17,7 @@ export function realtimeUrl(location: Pick<Location, 'protocol' | 'host'> = wind
 }
 
 /** Synchronous capture: the timestamp belongs to this image, never to the handshake. */
-export function captureRealtimeFrame(video: HTMLVideoElement): string {
+export function captureRealtimeFrame(video: HTMLVideoElement, flipHorizontal: boolean): string {
   const canvas = document.createElement('canvas');
   try {
     if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) throw new Error('当前画面不可用，请重新选择输入。');
@@ -27,6 +27,7 @@ export function captureRealtimeFrame(video: HTMLVideoElement): string {
     for (let attempt = 0; attempt < 4; attempt++, scale *= 0.75) {
       canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
       canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      if (flipHorizontal) context.setTransform(-1, 0, 0, 1, canvas.width, 0);
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       for (const quality of [0.65, 0.5, 0.35]) {
         const data = canvas.toDataURL('image/jpeg', quality);
@@ -39,22 +40,21 @@ export function captureRealtimeFrame(video: HTMLVideoElement): string {
   } finally { canvas.width = canvas.height = 0; }
 }
 
-type Pending = {
-  frame: RealtimeFrame;
-  resolve: (result: Analysis) => void;
-  reject: (reason: Error) => void;
-  cleanup: () => void;
-};
 type Options = {
   onState: (state: RealtimeState) => void;
   onReady: () => void;
+  onResult: (result: Analysis, capturedAt: number) => void;
   onDisconnect: (error: RealtimeError, retrying: boolean) => void;
 };
+const MAX_TRACKED_FRAMES = 16;
 
-/** Owns one socket and at most one frame. No image queue, including while recovering. */
+/** Paced continuous sends; retain only bounded metadata, never an image queue. */
 export class RealtimeClient {
   private socket: WebSocket | null = null;
-  private pending: Pending | null = null;
+  private outstanding = new Map<number, { session: string; capturedAt: number }>();
+  private session: string | null = null;
+  private lastFrameId = 0;
+  private frameTimer?: ReturnType<typeof setTimeout>;
   private readyTimer?: ReturnType<typeof setTimeout>;
   private retryTimer?: ReturnType<typeof setTimeout>;
   private enabled = false;
@@ -64,6 +64,7 @@ export class RealtimeClient {
 
   constructor(private options: Options) {}
   get isReady() { return this.state === 'connected' && this.socket?.readyState === WebSocket.OPEN; }
+  get canSend() { return this.isReady && this.socket!.bufferedAmount === 0 && Date.now() - this.lastSentAt >= 1000; }
 
   start() {
     if (this.enabled) return;
@@ -77,6 +78,7 @@ export class RealtimeClient {
   private open() {
     if (!this.enabled) return;
     this.update(this.attempts ? 'recovering' : 'connecting');
+    if (!this.enabled) return;
     let socket: WebSocket;
     try { socket = new WebSocket(realtimeUrl()); }
     catch { this.fail(new RealtimeError('network', '无法建立实时连接。')); return; }
@@ -96,19 +98,22 @@ export class RealtimeClient {
         if (this.state === 'connected') return;
         clearTimeout(this.readyTimer); this.readyTimer = undefined;
         this.update('connected');
-        this.options.onReady();
+        if (current()) this.options.onReady();
       } else if (message.type === 'error') {
         this.fail(new RealtimeError(message.error_code, message.message || '实时识别不可用。'));
       } else if (message.type === 'result') {
-        const pending = this.pending;
-        if (!pending || message.session_id !== pending.frame.session_id || message.frame_id !== pending.frame.frame_id) return;
+        const metadata = this.outstanding.get(message.frame_id);
+        if (!metadata || message.session_id !== this.session || message.session_id !== metadata.session) return;
         if (!Array.isArray(message.events) || !['ok', 'uncertain', 'error'].includes(message.status)) {
           this.fail(new RealtimeError('protocol', '实时识别响应格式不正确。')); return;
         }
         if (message.status === 'error') {
           this.fail(new RealtimeError(message.error_code ?? 'protocol', message.message || '实时识别不可用。')); return;
         }
-        this.pending = null; pending.cleanup(); pending.resolve(message);
+        // A newer result also retires pending frames dropped by the backend.
+        for (const id of this.outstanding.keys()) if (id <= message.frame_id) this.outstanding.delete(id);
+        this.watchProgress();
+        this.options.onResult(message, metadata.capturedAt);
       }
     };
     // Detach and fence before close: error + close must consume just one retry.
@@ -116,38 +121,50 @@ export class RealtimeClient {
     socket.onclose = () => { if (current()) this.fail(new RealtimeError('network', '实时连接已断开。')); };
   }
 
-  send(frame: RealtimeFrame, signal: AbortSignal): Promise<Analysis> | null {
-    if (signal.aborted) return Promise.reject(new DOMException('已取消实时识别', 'AbortError'));
-    if (!this.isReady || this.pending || this.socket!.bufferedAmount > 0 || Date.now() - this.lastSentAt < 1000) return null;
-    if (!frame.image.length || frame.image.length > MAX_IMAGE_BASE64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(frame.image)) {
-      return Promise.reject(new Error('画面不是有效的限额内纯 base64 JPEG，未发送。'));
+  send(frame: RealtimeFrame, capturedAt: number): boolean {
+    if (!this.canSend) return false;
+    if (typeof frame.image !== 'string' || !frame.image.startsWith('/9j/') || frame.image.length > MAX_IMAGE_BASE64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(frame.image)) {
+      throw new Error('画面不是有效的限额内纯 base64 JPEG，未发送。');
     }
-    return new Promise<Analysis>((resolve, reject) => {
-      const abort = () => this.close();
-      const timer = setTimeout(() => this.fail(new RealtimeError('model_timeout', '本帧识别超过 9 秒，已丢弃。')), FRAME_TIMEOUT);
-      this.pending = { frame, resolve, reject, cleanup: () => { clearTimeout(timer); signal.removeEventListener('abort', abort); } };
-      signal.addEventListener('abort', abort, { once: true });
-      try { this.lastSentAt = Date.now(); this.socket!.send(JSON.stringify(frame)); }
-      catch { this.fail(new RealtimeError('network', '实时画面发送失败。')); }
-    });
+    if (frame.type !== 'frame' || frame.mode !== 'walk' || !['camera', 'video'].includes(frame.source)
+      || typeof frame.session_id !== 'string' || !frame.session_id || (this.session !== null && frame.session_id !== this.session)
+      || !Number.isSafeInteger(frame.frame_id) || frame.frame_id <= this.lastFrameId || !Number.isFinite(capturedAt)) {
+      throw new Error('实时画面元数据无效；切换会话前请关闭连接，未发送。');
+    }
+    try { this.socket!.send(JSON.stringify(frame)); }
+    catch { this.fail(new RealtimeError('network', '实时画面发送失败。')); return false; }
+    this.lastSentAt = Date.now();
+    this.lastFrameId = frame.frame_id;
+    this.session = frame.session_id;
+    this.outstanding.set(frame.frame_id, { session: frame.session_id, capturedAt });
+    if (this.outstanding.size > MAX_TRACKED_FRAMES) this.outstanding.delete(this.outstanding.keys().next().value!);
+    // Sending more images is not analysis progress and must not defer the watchdog.
+    if (!this.frameTimer) this.watchProgress();
+    return true;
   }
 
-  private retire(reason: Error) {
+  private watchProgress() {
+    clearTimeout(this.frameTimer); this.frameTimer = undefined;
+    if (this.outstanding.size) {
+      this.frameTimer = setTimeout(() => this.fail(new RealtimeError('model_timeout', '实时识别超过 9 秒未返回新结果，已断开。')), FRAME_TIMEOUT);
+    }
+  }
+
+  private retire() {
     clearTimeout(this.readyTimer); this.readyTimer = undefined;
+    clearTimeout(this.frameTimer); this.frameTimer = undefined;
+    this.outstanding.clear(); this.session = null; this.lastFrameId = 0; this.lastSentAt = -Infinity;
     const socket = this.socket;
     this.socket = null;
     if (socket) {
       socket.onmessage = socket.onerror = socket.onclose = socket.onopen = null;
       socket.close();
     }
-    const pending = this.pending;
-    this.pending = null;
-    if (pending) { pending.cleanup(); pending.reject(reason); }
   }
 
   private fail(error: RealtimeError) {
     if (!this.enabled) return;
-    this.retire(error);
+    this.retire();
     const retrying = error.retryable && this.attempts < BACKOFF.length;
     if (retrying) {
       const delay = BACKOFF[this.attempts++];
@@ -160,7 +177,7 @@ export class RealtimeClient {
   close() {
     this.enabled = false;
     clearTimeout(this.retryTimer); this.retryTimer = undefined;
-    this.retire(new DOMException('已取消实时识别', 'AbortError'));
+    this.retire();
     this.update('disconnected');
   }
 }

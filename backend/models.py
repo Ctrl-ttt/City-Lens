@@ -28,6 +28,7 @@ class Observation(StrictModel):
     label: str = Field(max_length=24)
     direction: Literal['left', 'front', 'right', 'unknown']
     text: str = Field(default='', max_length=80)
+    clarity: Literal['high', 'medium', 'low'] | None = None
 
     @model_validator(mode='after')
     def check_label(self):
@@ -35,9 +36,11 @@ class Observation(StrictModel):
             raise ValueError('unsupported observation')
         if self.category == 'text':
             self.text = ' '.join(self.text.split())
-            if not self.text:
-                raise ValueError('empty sign')
+            if not self.text or self.clarity is None:
+                raise ValueError('sign requires text and clarity')
         else:
+            if self.clarity is not None:
+                raise ValueError('clarity is only valid for signs')
             # Do not let unconstrained model descriptions become navigation advice.
             self.text = LABELS[self.label][1]
         return self

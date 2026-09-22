@@ -21,6 +21,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.websockets import WebSocketState
 
 from .models import AnalyzeInput, AnalyzeResponse, RealtimeFrame
+from .link2 import camera_router
 from .realtime import MAX_FRAME_MESSAGE, realtime_session
 from .rules import summarize
 from .vision import Settings, VisionError, observe
@@ -100,6 +101,7 @@ def create_app(settings: Settings | None = None, transport=None):
     app = FastAPI(title='CityLens', version='0.1.0', lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1', '[::1]', 'testserver'])
     app.state.settings = config
+    app.include_router(camera_router(ALLOWED_ORIGINS))
 
     @app.get('/api/health')
     async def health():
@@ -125,15 +127,16 @@ def create_app(settings: Settings | None = None, transport=None):
             if app.state.realtime_lock.locked():
                 raise VisionError('busy')
             async with app.state.realtime_lock:
-                frames = asyncio.Queue(maxsize=1)
                 ready = False
-                busy = False
+                generating = False
                 session_id = None
+                source = None
                 frame_id = -1
                 last_frame_at = 0.0
+                pending_frame = asyncio.Queue(maxsize=1)
 
                 async def receive_frames():
-                    nonlocal busy, session_id, frame_id, last_frame_at
+                    nonlocal session_id, source, frame_id, last_frame_at
                     while True:
                         message = await socket.receive()
                         if message['type'] == 'websocket.disconnect':
@@ -142,19 +145,26 @@ def create_app(settings: Settings | None = None, transport=None):
                         if text is None or len(text) > MAX_FRAME_MESSAGE:
                             raise VisionError('invalid_input')
                         frame = RealtimeFrame.model_validate_json(text)
-                        if not ready or busy:
+                        if not ready or (app.state.lock.locked() and not generating):
                             raise VisionError('busy')
-                        if (session_id is not None and frame.session_id != session_id) or frame.frame_id <= frame_id:
+                        if (session_id is not None and (frame.session_id != session_id or frame.source != source)) or frame.frame_id <= frame_id:
                             raise VisionError('invalid_input')
                         now = time.monotonic()
                         if now - last_frame_at < 0.9:
                             raise VisionError('rate_limited')
-                        session_id, frame_id, last_frame_at = frame.session_id, frame.frame_id, now
-                        busy = True
-                        frames.put_nowait(frame)
+                        session_id, source, frame_id, last_frame_at = frame.session_id, frame.source, frame.frame_id, now
+                        try:
+                            image = clean_jpeg(base64.b64decode(frame.image, validate=True), max_side=960, quality=65)
+                        except (binascii.Error, ValueError):
+                            raise VisionError('invalid_input') from None
+                        meta = AnalyzeInput(session_id=frame.session_id, frame_id=frame.frame_id, mode=frame.mode, source=frame.source)
+                        if pending_frame.full():
+                            pending_frame.get_nowait()
+                        pending_frame.put_nowait((image, meta, now))
+                        del frame, image, meta, message, text
 
                 async def process_frames():
-                    nonlocal ready, busy
+                    nonlocal ready, generating
                     async with realtime_session(config) as session:
                         opened = time.monotonic()
                         ready = True
@@ -163,21 +173,20 @@ def create_app(settings: Settings | None = None, transport=None):
                             if time.monotonic() - opened > 110 * 60:
                                 raise VisionError('realtime_expired')
                             try:
-                                frame = await asyncio.wait_for(frames.get(), timeout=REALTIME_IDLE_TIMEOUT)
+                                image, frame, received_at = await asyncio.wait_for(pending_frame.get(), timeout=REALTIME_IDLE_TIMEOUT)
                             except TimeoutError:
                                 raise VisionError('realtime_idle') from None
-                            started = time.monotonic()
-                            try:
-                                image = clean_jpeg(base64.b64decode(frame.image, validate=True), max_side=960, quality=65)
-                            except (binascii.Error, ValueError):
-                                raise VisionError('invalid_input') from None
                             if app.state.lock.locked():
                                 raise VisionError('busy')
-                            async with app.state.lock:
-                                result = await session.observe(image)
+                            generating = True
+                            try:
+                                async with app.state.lock:
+                                    result = await session.observe(image)
+                            finally:
+                                generating = False
+                                del image
                             response = summarize(frame, result)
-                            response.latency_ms = int((time.monotonic() - started) * 1000)
-                            busy = False
+                            response.latency_ms = int((time.monotonic() - received_at) * 1000)
                             await socket.send_json({'type': 'result', **response.model_dump()})
                             logger.info('realtime status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
 
