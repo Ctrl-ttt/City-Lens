@@ -3,8 +3,8 @@ param([switch]$Browser)
 $ErrorActionPreference = 'Stop'
 Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
-    & ./.venv/Scripts/python.exe -m pytest backend/tests -q
-    if ($LASTEXITCODE -ne 0) { throw 'Backend tests failed.' }
+    & ./.venv/Scripts/python.exe -m pytest backend/tests tools/test_x4_export.py tools/test_x4_equirect_unofficial.py -q
+    if ($LASTEXITCODE -ne 0) { throw 'Backend or video export tool tests failed.' }
     & pnpm --dir frontend test
     if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed.' }
     & pnpm --dir frontend build
