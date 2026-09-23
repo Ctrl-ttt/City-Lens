@@ -1,4 +1,4 @@
-import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
+﻿import { test, expect, type Page, type WebSocketRoute } from '@playwright/test';
 import type { Analysis, Health, RealtimeFrame } from '../src/types';
 
 declare global {

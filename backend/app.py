@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import base64
 import binascii
 import io
@@ -27,6 +27,7 @@ from .panorama import prepare_panorama
 from .spatial import SpatialSessions
 from .rules import summarize
 from .vision import Settings, VisionError, observe
+from .plugins.skylight import router as skylight_router
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_IMAGE = 2 * 1024 * 1024
@@ -69,6 +70,13 @@ def float_env(name, fallback):
         return fallback
 
 
+def bool_env(name, fallback=True):
+    value = os.getenv(name)
+    if value is None:
+        return fallback
+    return value.strip().lower() not in ('0', 'false', 'no', 'off')
+
+
 def detail_env(name, fallback='medium'):
     value = os.getenv(name, fallback).strip().lower()
     return value if value in {'low', 'medium', 'high'} else fallback
@@ -97,6 +105,9 @@ def load_settings():
                     speech_repeat_seconds=float_env('CITYLENS_SPEECH_REPEAT_SECONDS', 4.0),
                     min_confidence=float_env('CITYLENS_MIN_CONFIDENCE', 0.5),
                     continuous_repeat_seconds=float_env('CITYLENS_CONTINUOUS_REPEAT_SECONDS', 12.0),
+                    skylight_enabled=bool_env('CITYLENS_SKYLIGHT_ENABLED', True),
+                    skylight_model=os.getenv('CITYLENS_SKYLIGHT_MODEL', '').strip(),
+                    skylight_timeout=float_env('CITYLENS_SKYLIGHT_TIMEOUT', 22.0),
                     speech_score_threshold=float_env('CITYLENS_SPEECH_SCORE_THRESHOLD', 70.0),
                     speech_detail_level=detail_env('CITYLENS_SPEECH_DETAIL_LEVEL'))
 
@@ -139,6 +150,7 @@ def create_app(settings: Settings | None = None, transport=None):
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1', '[::1]', 'testserver'])
     app.state.settings = config
     app.include_router(camera_router(ALLOWED_ORIGINS))
+    app.include_router(skylight_router)
 
     @app.get('/api/health')
     async def health():
@@ -151,6 +163,9 @@ def create_app(settings: Settings | None = None, transport=None):
                 'speech_score_threshold': config.speech_score_threshold,
                 'speech_detail_level': config.speech_detail_level,
                 'sample_scene': config.sample_scene if config.provider == 'sample' else None,
+                'plugins': {'skylight': {'enabled': config.skylight_enabled,
+                                        'configured': config.skylight_configured,
+                                        'model': config.skylight_model or config.model}},
                 'version': '0.1.0'}
 
     @app.websocket('/api/realtime')

@@ -1,4 +1,4 @@
-import { defineConfig } from '@playwright/test';
+﻿import { defineConfig } from '@playwright/test';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

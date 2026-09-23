@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+﻿import { test, expect, type Page } from '@playwright/test';
 
 async function panoramaVideo(page: Page) {
   // Explicit synthetic geometry fixture, not actual camera/model evidence.

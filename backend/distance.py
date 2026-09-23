@@ -1,4 +1,4 @@
-import math
+﻿import math
 
 from .models import Observation
 from .vision import Settings

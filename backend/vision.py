@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import base64
 import json
 from dataclasses import dataclass
@@ -53,6 +53,9 @@ class Settings:
     speech_repeat_seconds: float = 4.0
     min_confidence: float = 0.5
     continuous_repeat_seconds: float = 12.0
+    skylight_enabled: bool = True
+    skylight_model: str = ''
+    skylight_timeout: float = 22.0
     speech_score_threshold: float = 70.0
     speech_detail_level: str = 'medium'
 
@@ -74,6 +77,10 @@ class Settings:
     @property
     def configured(self):
         return self.realtime_configured if self.provider == 'realtime' else self.http_configured
+
+    @property
+    def skylight_configured(self):
+        return self.skylight_enabled and (self.provider == 'sample' or bool(self.api_key and self.base_url and (self.skylight_model or self.model)))
 
 
 def parse_result(content: str, panorama: bool = False, mode: Mode = 'walk') -> VisionResult:

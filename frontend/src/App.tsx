@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState } from 'react';
+﻿import { useEffect, useRef, useState } from 'react';
 import { Accessibility, ALargeSmall, Camera, Contrast, FileVideo, Headphones, Info, Pause, Play, RotateCcw, ScanText, Square, Volume2, VolumeX } from 'lucide-react';
-import type { Analysis, Channel, Health, Mode, Projection, RealtimeState, Source, SpeechDetailLevel } from './types';
+import type { Analysis, Channel, FoodDetail, FoodResult, Health, Mode, Projection, RealtimeState, Source, SpeechDetailLevel } from './types';
 import { SessionGate, HttpError } from './session';
 import { FramePacer, waitForVideoFrame } from './capture';
 import { directionFromBox, estimateLocalProximity, FrameHistory, rewriteSpeechForMotion, snapshotVideo, trackTrajectory, type GrayFrame } from './motion';
 import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from './speech';
 import { captureRealtimeFrame, RealtimeClient } from './realtime';
+import { FOOD_DETAIL_STORAGE, foodDetailNames, loadFoodDetail, buildFoodSpeech } from './food';
 import cityLensMark from './assets/citylens-mark.svg';
-import Link2Controls from './Link2Controls';
 import './brand.css';
 
 const sourceNames = { camera: '实时摄像头', video: '路线视频回放' };
@@ -55,6 +55,7 @@ export default function App() {
   const motionFrames = useRef(new Map<string, GrayFrame>());
   const frameHistory = useRef(new FrameHistory());
   const scratch = useRef<HTMLCanvasElement | null>(null);
+  const foodScratch = useRef<HTMLCanvasElement | null>(null);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -68,10 +69,11 @@ export default function App() {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState('');
   const [activeCameraLabel, setActiveCameraLabel] = useState('');
-  const [cameraControlCount, setCameraControlCount] = useState(0);
-  const cameraControlBusy = cameraControlCount > 0;
   const [fileName, setFileName] = useState('');
   const [result, setResult] = useState<Analysis | null>(null);
+  const [foodResult, setFoodResult] = useState<FoodResult | null>(null);
+  const [foodBusy, setFoodBusy] = useState(false);
+  const [foodDetail, setFoodDetail] = useState<FoodDetail>(loadFoodDetail);
   const [history, setHistory] = useState<Analysis[]>([]);
   const [roundtrip, setRoundtrip] = useState(0);
   const [predictionAudit, setPredictionAudit] = useState<PredictionAudit | null>(null);
@@ -111,7 +113,7 @@ export default function App() {
     queue.current?.clear(); last.current = null;
     motionFrames.current.clear();
     frameHistory.current.clear();
-    setResult(null); setHistory([]); setRoundtrip(0); setPredictionAudit(null);
+    setResult(null); setFoodResult(null); setHistory([]); setRoundtrip(0); setPredictionAudit(null);
   }
   function invalidate(message?: string) {
     httpPacer.current.reset();
@@ -278,7 +280,7 @@ export default function App() {
   }
 
   async function start(readMode = false, once = false) {
-    if (!consent || !(readMode ? httpConfigured : channelConfigured) || connecting || cameraControlBusy || document.hidden) return;
+    if (!consent || !(readMode ? httpConfigured : channelConfigured) || connecting || document.hidden) return;
     if (!readMode) { invalidate(); setError(''); cooldownUntil.current = 0; }
     // A read turn is an independent signal: it never tears down the running walk stream.
     const session = gate.current.session;
@@ -536,6 +538,42 @@ export default function App() {
     }
   }
 
+  async function analyzeSkylight() {
+    const element = video.current;
+    if (foodBusy || !element || element.readyState < 2 || element.videoWidth === 0 || document.hidden) return;
+    if (projection === 'equirectangular' && Math.abs(element.videoWidth / element.videoHeight - 2) > 0.04) {
+      setError('请选择已拼接的 2:1 全景输入；X4 Air 原始双鱼眼文件需先导出全景 MP4。');
+      return;
+    }
+    setFoodBusy(true); setError('');
+    try {
+      const canvas = foodScratch.current ??= document.createElement('canvas');
+      const scale = Math.min(1, 1920 / Math.max(element.videoWidth, element.videoHeight));
+      canvas.width = Math.round(element.videoWidth * scale);
+      canvas.height = Math.round(element.videoHeight * scale);
+      const context = canvas.getContext('2d')!;
+      const flip = sourceRef.current === 'camera' && projection === 'rectilinear';
+      context.setTransform(flip ? -1 : 1, 0, 0, 1, flip ? canvas.width : 0, 0);
+      context.drawImage(element, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.82));
+      if (!blob) throw new Error('无法读取当前画面，请重新选择输入。');
+      const form = new FormData();
+      form.append('image', blob, 'skylight.jpg');
+      form.append('projection', projection); form.append('heading_deg', String(heading));
+      form.append('source', sourceRef.current);
+      const response = await fetch('/api/plugins/skylight/analyze', { method: 'POST', body: form });
+      const data = await response.json();
+      if (!response.ok || data.error_code) throw new Error(data.message || '食材识别服务不可用，请稍后重试。');
+      setFoodResult(data as FoodResult);
+      const items = (data as FoodResult).items ?? [];
+      setNotice(items.length ? `Skylight 识别到 ${items.length} 种食材` : '当前画面没有可确认的食材');
+      const speech = buildFoodSpeech(items, foodDetail);
+      queue.current?.offer({ key: 'skylight-food', priority: 'normal', text: speech, session: gate.current.session, capturedAt: Date.now(), maxAge: 20000, manual: true });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '食材识别失败，请重试。');
+    } finally { setFoodBusy(false); }
+  }
+
   function loadVideo(file?: File) {
     if (!file) return;
     invalidate('视频已选择，请开始识别'); releaseCamera(); setError(''); setReady(false);
@@ -548,6 +586,10 @@ export default function App() {
     queue.current?.offer({ ...last.current, text: `上一条提示：${last.current.text}`, capturedAt: Date.now(), maxAge: 8000, manual: true });
   }
   function toggleMute() { const next = !muted; setMuted(next); queue.current?.mute(next); }
+  function changeFoodDetail(next: FoodDetail) {
+    setFoodDetail(next);
+    try { localStorage.setItem(FOOD_DETAIL_STORAGE, next); } catch { /* private mode: keep the choice for this session only */ }
+  }
   function voiceTest() {
     if (!voiceName) { setVoiceError('未发现中文语音。请在 Windows 语言设置安装中文语音后重启浏览器。'); return; }
     setVoiceError('');
@@ -556,7 +598,8 @@ export default function App() {
   const httpConfigured = !!health && health.http_configured;
   const realtimeConfigured = !!health && health.provider !== 'sample' && health.realtime_configured;
   const channelConfigured = channel === 'realtime' ? realtimeConfigured : httpConfigured;
-  const permitted = consent && channelConfigured && !connecting && !cameraControlBusy;
+  const skylightConfigured = !!health?.plugins?.skylight?.enabled && !!health?.plugins?.skylight?.configured;
+  const permitted = consent && channelConfigured && !connecting;
   const connectionNames: Record<RealtimeState, string> = { waiting: '待连接', connecting: '连接中', connected: '已连接', recovering: '恢复中', disconnected: '已断开' };
   const currentModel = health?.provider === 'sample' ? health.model : reading || channel === 'http' ? health?.http_model : health?.realtime_model;
 
@@ -594,7 +637,8 @@ export default function App() {
         <fieldset className="source-field"><legend>播报策略</legend><label>详细度：<select aria-label="播报详细度" value={speechDetail} onChange={e => setSpeechDetail(e.target.value as SpeechDetailLevel)}><option value="low">低（仅方向，最多3项）</option><option value="medium">中（方向+距离，最多2项）</option><option value="high">高（方向+距离+速度，最多1项）</option></select></label><label>播报阈值：{speechThreshold} 分 <input aria-label="播报阈值" type="range" min="0" max="200" step="5" value={speechThreshold} onChange={e => setSpeechThreshold(Number(e.target.value))}/></label><p className="quiet-note">只有综合分超过阈值才播报。详细度越高，每次播报项数越少；播报项数不等于抽帧频率。速度仅表示画面中的接近趋势，不输出米/秒。</p></fieldset>
         <p className="quiet-note">结合物体类型、方向、粗略远近和接近趋势选择提示；远近只用于风险排序，不提供精确测距或通行判断。</p>
         <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
-        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || cameraControlBusy || reading || (busy && channel === 'http')} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
+        <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || reading || (busy && channel === 'http')} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button disabled={!consent || !skylightConfigured || !ready || running || connecting || foodBusy || busy} onClick={() => void analyzeSkylight()}><ScanText aria-hidden="true"/>{foodBusy ? '食材识别中…' : 'Skylight · 识别食材'}</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
+        {skylightConfigured && <fieldset className="source-field"><legend>食材播报详略</legend><label>语音播报内容 <select aria-label="食材语音播报详略" value={foodDetail} onChange={e => changeFoodDetail(e.target.value as FoodDetail)}><option value="brief">简洁 · 只报数量与名称</option><option value="standard">标准 · 名称+新鲜度+挑选</option><option value="detailed">详细 · 含特征与注意</option></select></label><p className="quiet-note">供不同需求选择：需要快速定位选“简洁”，需要充分信息选“详细”。调整后立即生效，浏览器会记住当前为“{foodDetailNames[foodDetail]}”。屏幕展示不受影响。</p></fieldset>}
       </section>
       <div className="workspace">
         <section className="camera-card" aria-label="画面输入">
@@ -608,9 +652,9 @@ export default function App() {
                 const labelX = modelBox ? mirrored ? 1000 - modelBox[2] + 8 : modelBox[0] + 8 : 0;
                 return <g key={`${event.label}-${i}`}>
                   <g transform={mirrored ? 'translate(1000 0) scale(-1 1)' : undefined}>
-                    {modelBox && <rect className={event.original_box ? 'motion-box-original' : 'motion-box-model'} x={modelBox[0]} y={modelBox[1]} width={modelBox[2]-modelBox[0]} height={modelBox[3]-modelBox[1]}/>} 
-                    {event.original_box && event.box && <rect className="motion-box-current" x={event.box[0]} y={event.box[1]} width={event.box[2]-event.box[0]} height={event.box[3]-event.box[1]}/>} 
-                    {event.predicted_box && <rect className="motion-box-predicted" x={event.predicted_box[0]} y={event.predicted_box[1]} width={event.predicted_box[2]-event.predicted_box[0]} height={event.predicted_box[3]-event.predicted_box[1]}/>} 
+                    {modelBox && <rect className={event.original_box ? 'motion-box-original' : 'motion-box-model'} x={modelBox[0]} y={modelBox[1]} width={modelBox[2]-modelBox[0]} height={modelBox[3]-modelBox[1]}/>}
+                    {event.original_box && event.box && <rect className="motion-box-current" x={event.box[0]} y={event.box[1]} width={event.box[2]-event.box[0]} height={event.box[3]-event.box[1]}/>}
+                    {event.predicted_box && <rect className="motion-box-predicted" x={event.predicted_box[0]} y={event.predicted_box[1]} width={event.predicted_box[2]-event.predicted_box[0]} height={event.predicted_box[3]-event.predicted_box[1]}/>}
                   </g>
                   {modelBox && <text className="motion-box-label" x={labelX} y={Math.max(22, modelBox[1] - 8)}>{event.text}</text>}
                 </g>;
@@ -619,12 +663,12 @@ export default function App() {
             {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true">{source === 'camera' ? <Camera/> : <FileVideo/>}</div><h3>{source==='camera' ? '摄像头尚未开启' : '尚未选择路线视频'}</h3><p>{source==='camera' ? '可先仅本地预览，确认画面后开始识别' : '选择本地 MP4 后开始识别'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
-          <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><button disabled={connecting} onClick={() => void previewCamera()}>仅本地预览</button><small>{activeCameraLabel ? `当前输入：${activeCameraLabel}` : '支持 Link 2 / USB 摄像头'} · 仅本地预览不会上传画面</small></>}</div>
-          {source === 'camera' && <Link2Controls activeLabel={activeCameraLabel} cameraLabels={devices.map(d => d.label)} beforeControl={() => invalidate('相机画面正在调整，识别已暂停。确认画面稳定后重新开始。')} onControlBusyChange={pending => setCameraControlCount(count => count + (pending ? 1 : -1))}/>}
+          <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><button disabled={connecting} onClick={() => void previewCamera()}>仅本地预览</button><small>{activeCameraLabel ? `当前输入：${activeCameraLabel}` : '支持 USB / 全景摄像头'} · 仅本地预览不会上传画面</small></>}</div>
         </section>
         <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 6 项 · 当前档位最多 {speechDetail === 'low' ? 3 : speechDetail === 'medium' ? 2 : 1} 项播报</span></div>
           <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{event.direction_predicted && event.original_direction ? `${directionNames[event.original_direction]}→` : ''}{directionNames[event.direction]}{event.approaching ? " · 疑似靠近" : ""}{event.speed_level && event.speed_level !== 'unknown' ? ` · ${event.speed_level === 'fast' ? '快速' : event.speed_level === 'medium' ? '中速' : '缓慢'}接近` : ""}{event.proximity && event.proximity !== "unknown" ? ` · 本地粗估${{near:"较近",mid:"中距",far:"较远"}[event.proximity]}` : ""}{event.motion_compensated ? ` · 连续跟踪${event.motion_samples ?? 0}帧` : ""}</span></div>)}</div>
           {!result?.events.length && <div className="empty-events"><Info aria-hidden="true"/><p>识别后，这里会列出当前画面中可确认的信息。</p></div>}
+          {foodResult && <div className="food-plugin-result" aria-label="Skylight 食材识别结果"><div className="food-plugin-heading"><strong>Skylight 食材识别</strong><span>{foodResult.items.length} 种 · {foodResult.projection === 'equirectangular' ? 'X4 Air 全景' : '当前视角'}</span></div>{foodResult.items.map((item, i) => <article className="food-item" key={`${item.name}-${i}`}><strong>{item.name}</strong><span>{item.description}</span><small>可见新鲜度：{item.freshness_label}（{item.freshness_score}/100）</small><p>挑选：{item.selection_tip}</p><p>注意：{item.warning}</p></article>)}{foodResult.scene_note && <p className="quiet-note">{foodResult.scene_note}</p>}</div>}
           {predictionAudit && <div className={`prediction-audit ${predictionAudit.state}`} role="status" aria-label="预测对播报的影响">
             <div><span>预测对播报的影响</span><strong>{predictionAudit.title}</strong></div>
             <p>{predictionAudit.detail}</p>

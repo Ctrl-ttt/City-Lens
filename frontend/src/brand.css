@@ -1,4 +1,4 @@
-/* CityLens · 全局样式表（无障碍优先）
+﻿/* CityLens · 全局样式表（无障碍优先）
    结构由 App.tsx 定义；这里只负责呈现层。
    1) 设计变量  2) 基础元素  3) 页头  4) 当前提示  5) 提示条与操作区
    6) 观察窗口与识别详情  7) 语音与运行详情  8) 显示模式  9) 响应式 */
@@ -875,12 +875,10 @@ footer {
   .brand small { letter-spacing: 1.2px; }
 }
 
-.link2-panel { margin: 0 24px 24px; border-top: 1px solid var(--border, #d9dfd8); padding-top: 16px; }
-.link2-panel summary { cursor: pointer; font-weight: 700; padding: 10px 0; }
-.link2-panel p { margin: 12px 0; }
-.link2-panel fieldset { margin: 16px 0; padding: 12px; border: 1px solid var(--border, #d9dfd8); border-radius: 12px; }
-.link2-panel button { margin: 4px 8px 4px 0; }
-.link2-fields { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; }
-.link2-fields label { flex: 1 1 150px; }
-.link2-fields input { display: block; width: 100%; min-height: 44px; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 8px; padding: 8px; }
-.link2-panel input[type="range"] { display: block; width: 100%; min-height: 44px; }
+.food-plugin-result { margin-top: 18px; border-top: 1px solid var(--border, #d9dfd8); padding-top: 16px; }
+.food-plugin-heading { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.food-plugin-heading span { color: var(--muted, #5b6b63); font-size: .88rem; }
+.food-item { display: grid; gap: 5px; padding: 12px 0; border-top: 1px solid var(--border, #e4e8e3); }
+.food-item:first-of-type { border-top: 0; }
+.food-item > span, .food-item > small, .food-item > p { margin: 0; color: var(--muted, #5b6b63); }
+.food-item > p { font-size: .9rem; }

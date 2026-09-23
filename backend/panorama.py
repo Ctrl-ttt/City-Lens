@@ -1,4 +1,4 @@
-"""Explicit ERP input -> six perspective faces, one cloud request.
+﻿"""Explicit ERP input -> six perspective faces, one cloud request.
 
 Uses py360convert (MIT); no raw fisheye stitching or camera calibration is implied.
 The heading is relative to the panorama, not a measured user heading.

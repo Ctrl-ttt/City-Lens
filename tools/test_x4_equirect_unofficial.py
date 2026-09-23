@@ -337,3 +337,94 @@ def test_preview_gets_its_own_default_name(insv, monkeypatch):
 @pytest.mark.parametrize("arguments", [["--preview", "0"], ["--in-fov", "400"], ["--in-fov", "0"]])
 def test_main_rejects_bad_numbers(insv, arguments):
     assert tool.main([str(insv), *arguments]) == 1
+
+
+@pytest.fixture(scope="module")
+def lrv(tmp_path_factory):
+    """单条并排双鱼眼视频轨加一条音轨，复刻 Insta360 .lrv 代理的结构。"""
+    path = tmp_path_factory.mktemp("proxy") / "LRV_合成.lrv"
+    width, height = LENS * 2, LENS
+    with av.open(str(path), "w", format="mp4") as output:
+        video = output.add_stream("libx265", rate=RATE, options=fast_options("libx265", 1))
+        video.width = width
+        video.height = height
+        video.pix_fmt = "yuv420p"
+        audio = output.add_stream("aac", rate=48000)
+        audio.layout = "mono"
+        audio.sample_rate = 48000
+        for index in range(FRAMES):
+            plane = np.full((height * 3 // 2, width), (index * 30) % 256, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(plane, format="yuv420p")
+            frame.pts = index
+            for packet in video.encode(frame):
+                output.mux(packet)
+            sound = av.AudioFrame(format="fltp", layout="mono", samples=1600)
+            sound.sample_rate = 48000
+            sound.pts = index * 1600
+            sound.planes[0].update(np.zeros((1, 1600), dtype=np.float32))
+            for packet in audio.encode(sound):
+                output.mux(packet)
+        for packet in video.encode():
+            output.mux(packet)
+        for packet in audio.encode():
+            output.mux(packet)
+    return path
+
+
+def test_open_geometry_dual_for_two_tracks():
+    mode, lenses = tool.open_geometry(lens_container([lens_stream(0), lens_stream(1)]))
+    assert mode == "dual"
+    assert tuple(stream.index for stream in lenses) == (0, 1)
+
+
+def test_open_geometry_packed_for_single_2_to_1_track():
+    mode, lenses = tool.open_geometry(lens_container([lens_stream(0, name="h264", width=1664, height=832)]))
+    assert mode == "packed"
+    assert lenses[0].index == 0
+
+
+def test_packed_lens_accepts_single_2_to_1_track():
+    stream = tool.packed_lens(lens_container([lens_stream(0, name="h264", width=1664, height=832)]))
+    assert stream.index == 0
+
+
+@pytest.mark.parametrize(
+    "stream,message",
+    [
+        (lens_stream(0, name="h264", width=1600, height=832), "2:1"),
+        (lens_stream(0, name="h264", width=1665, height=832), "偶数"),
+    ],
+)
+def test_packed_lens_rejects_bad_geometry(stream, message):
+    with pytest.raises(tool.ExportError, match=message):
+        tool.packed_lens(lens_container([stream]))
+
+
+def test_packed_lens_needs_a_video_track():
+    with pytest.raises(tool.ExportError, match="没有视频轨"):
+        tool.packed_lens(lens_container([]))
+
+
+@needs_ffmpeg
+def test_transcode_handles_single_track_lrv(lrv, tmp_path, monkeypatch):
+    monkeypatch.setattr(tool, "encoder_options", fast_options)
+    destination = tmp_path / "代理全景.mp4"
+    frames = tool.transcode(
+        str(lrv), str(destination), 640, 320, 190.0, "cubic", "hevc", "libx265", 2_000_000
+    )
+    assert frames == FRAMES
+    seconds, has_audio = tool.validate(str(destination), 640, 320, 0.2)
+    assert has_audio
+    with av.open(str(destination)) as container:
+        video = container.streams.video[0]
+        assert (video.codec_context.width, video.codec_context.height) == (640, 320)
+
+
+@needs_ffmpeg
+def test_preview_stops_after_requested_seconds_for_lrv(lrv, tmp_path, monkeypatch):
+    monkeypatch.setattr(tool, "encoder_options", fast_options)
+    frames = tool.transcode(
+        str(lrv), str(tmp_path / "代理预览.mp4"), 640, 320, 190.0, "cubic", "hevc", "libx265",
+        2_000_000, preview_seconds=0.1,
+    )
+    assert frames == 3

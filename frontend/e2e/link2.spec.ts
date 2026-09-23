@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+﻿import { test, expect, type Page } from '@playwright/test';
 
 const device = { id: '6c696e6b32', name: 'Insta360 Link 2' };
 const cameraState = { ptz: { pan: 0, tilt: 0 }, zoom: { min: 100, max: 400, step: 10, value: 100 }, autofocus: true };

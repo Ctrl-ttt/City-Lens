@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([string]$Proxy = '')
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest

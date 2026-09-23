@@ -1,4 +1,4 @@
-# CityLens · 城市环境理解助手
+﻿# CityLens · 城市环境理解助手
 
 React + TypeScript + FastAPI 原型：摄像头或本地 MP4 抽帧 → 千问视觉模型 → 校验与排序 → 大字提示及中文语音。支持环境提示、按键看牌、暂停、静音、重播及按键识别。
 
@@ -52,6 +52,14 @@ DASHSCOPE_MODEL=qwen3-vl-plus
 停止样例服务后运行 `.\scripts\start.ps1`（不加 `-Sample`）。该脚本明确选择 live，避免因旧环境变量误用样例。检查 `/api/health` 的 `provider=live`、`configured=true`；这仅说明配置齐全，**不证明密钥权限有效**，还需要一次获授权图片的真实请求。模型失败不会自动回退样例；模型名、地址以实际赛事权限为准。
 
 API Key 只放后端，不能填入前端代码或提交仓库。不把密钥发到聊天、访谈或演示材料里。真实模式需用户在页面同意后才上传抽帧；本地 MP4 不整段上传。应用不将输入帧、原始视频或 OCR 全文写入日志；本次会话的结果暂存在内存。模型供应商的数据政策需要单独核实。
+
+### Skylight 食材识别插件
+
+页面中的“Skylight · 识别食材”是独立的按键能力：它只分析当前帧并返回食材名称、可见新鲜度线索和挑选建议，不会把食材写入 CityLens 环境事件，也不会改变原有 `/api/analyze`、实时 WebSocket、排序或环境播报。自动环境识别运行时按钮保持禁用，需先暂停，以免两个模型请求争用。
+
+插件默认启用并复用 `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL` 和 `DASHSCOPE_MODEL`；可用 `CITYLENS_SKYLIGHT_MODEL` 单独指定模型，或设置 `CITYLENS_SKYLIGHT_ENABLED=false` 完全关闭。食材识别输出更长，用 `CITYLENS_SKYLIGHT_TIMEOUT`（默认 22 秒）单独控制其超时，不影响环境识别的 8 秒预算。接口为 `POST /api/plugins/skylight/analyze`，只接受本地页面上传的 JPEG。
+
+X4 Air 使用 Insta360 Studio 导出的已拼接 2:1 全景 MP4，页面选择“360° 全景”后，插件复用 CityLens 的六方向透视切面和正前方角度校准。原始 `.insv`/双鱼眼文件仍需先导出；本插件不新增 X4 Air 实时 SDK 取流能力。
 
 ## 实时视觉预览
 

@@ -15,6 +15,11 @@ faces the equirect centre. Swapping the tracks rotates the whole panorama 180 de
 about the vertical, which exchanges front and back while the lens joins keep their
 positions in the frame.
 
+A single side-by-side dual-fisheye track (such as an Insta360 ``.lrv`` proxy) is also
+accepted: it is fed straight through v360, and ``--front-track 1`` then rotates the
+panorama 180 deg in yaw to exchange front and back. Proxies are low resolution, so
+use them for previews only, not as a master.
+
 Use it for previews, review, and scene-level analysis. When a stitched master is
 required, use the official Media SDK path (tools/x4_export.py) or Insta360 Studio.
 
@@ -107,6 +112,30 @@ def opened_lenses(container):
     return first, second
 
 
+def packed_lens(container):
+    """单条把前后鱼眼并排编码的视频轨，常见于 Insta360 的 .lrv 代理。"""
+    streams = container.streams.video
+    if not streams:
+        raise ExportError("文件没有视频轨。")
+    stream = streams[0]
+    context = stream.codec_context
+    if context.width % 2 or context.height % 2:
+        raise ExportError("单轨并排双鱼眼的宽高需为偶数。")
+    if context.width != 2 * context.height:
+        raise ExportError(
+            f"单轨输入需是并排的 2:1 双鱼眼（每颗鱼眼为方形），当前 {context.width}x{context.height}。"
+        )
+    return stream
+
+
+def open_geometry(container):
+    """挑选源布局：双轨方形鱼眼（.insv）或单轨并排双鱼眼（.lrv 代理）。"""
+    videos = container.streams.video
+    if len(videos) >= 2:
+        return "dual", opened_lenses(container)
+    return "packed", (packed_lens(container),)
+
+
 def pick_encoder(codec, requested, available):
     candidates = (requested,) if requested != "auto" else ENCODERS[(codec, "auto")]
     for name in candidates:
@@ -153,7 +182,7 @@ def stack_lenses(first, second, front_track=DEFAULT_FRONT_TRACK):
 class Reprojjector:
     """Feeds stacked dual-fisheye frames through v360 and returns equirect frames."""
 
-    def __init__(self, lens_width, lens_height, out_width, out_height, in_fov, interp, time_base):
+    def __init__(self, lens_width, lens_height, out_width, out_height, in_fov, interp, time_base, yaw=0.0):
         self.source_size = (2 * lens_width, lens_height)
         self.time_base = time_base
         graph = av.filter.Graph()
@@ -167,6 +196,8 @@ class Reprojjector:
             f"dfisheye:e:w={out_width}:h={out_height}"
             f":ih_fov={in_fov:g}:iv_fov={in_fov:g}:interp={interp}"
         )
+        if yaw:
+            arguments += f":yaw={yaw:g}"
         reproject = graph.add("v360", arguments)
         self.sink = graph.add("buffersink")
         self.source.link_to(reproject)
@@ -192,19 +223,51 @@ def probe_duration(container):
 def transcode(source_path, destination, width, height, in_fov, interp, codec, encoder, bitrate,
               preview_seconds=None, front_track=DEFAULT_FRONT_TRACK):
     with av.open(source_path) as container:
-        first, second = opened_lenses(container)
+        mode, lenses = open_geometry(container)
         audio = container.streams.audio[0] if container.streams.audio else None
-        rate = first.average_rate or Fraction(30000, 1001)
+        if mode == "dual":
+            first, second = lenses
+            video_streams = (first, second)
+            primary = first
+            lens_width = first.codec_context.width
+            lens_height = first.codec_context.height
+            yaw = 0.0
+
+            def combine():
+                return stack_lenses(
+                    queues[first.index].popleft(), queues[second.index].popleft(), front_track
+                )
+
+            def ready():
+                return bool(queues[first.index]) and bool(queues[second.index])
+        else:
+            (packed,) = lenses
+            video_streams = (packed,)
+            primary = packed
+            lens_width = packed.codec_context.width // 2
+            lens_height = packed.codec_context.height
+            # A single packed track has a fixed left/right layout, so front/back is
+            # swapped by rotating the equirect 180 deg in yaw instead of restacking.
+            yaw = 180.0 if front_track == 1 else 0.0
+
+            def combine():
+                return np.ascontiguousarray(
+                    queues[packed.index].popleft().to_ndarray(format="yuv420p")
+                )
+
+            def ready():
+                return bool(queues[packed.index])
+
+        rate = primary.average_rate or Fraction(30000, 1001)
         total_seconds = probe_duration(container)
         total_frames = int(total_seconds * rate) if total_seconds else None
         video_time_base = Fraction(rate.denominator, rate.numerator)
-        lens_width = first.codec_context.width
-        lens_height = first.codec_context.height
         limit_frames = int(preview_seconds * rate) if preview_seconds else None
         audio_horizon = preview_seconds if preview_seconds else float("inf")
+        layout = "双轨方形鱼眼" if mode == "dual" else "单轨并排双鱼眼"
         print(f"源：{os.path.basename(source_path)}")
         print(
-            f"  双鱼眼 {lens_width}x{lens_height} @ {float(rate):.3f} fps"
+            f"  {layout} 每眼 {lens_width}x{lens_height} @ {float(rate):.3f} fps"
             + (f"  时长 {total_seconds:.1f}s  约 {total_frames} 帧" if total_seconds else "")
         )
         print(
@@ -214,7 +277,9 @@ def transcode(source_path, destination, width, height, in_fov, interp, codec, en
             flush=True,
         )
 
-        reprojector = Reprojjector(lens_width, lens_height, width, height, in_fov, interp, video_time_base)
+        reprojector = Reprojjector(
+            lens_width, lens_height, width, height, in_fov, interp, video_time_base, yaw=yaw
+        )
 
         with av.open(destination, "w", format="mp4", options={"movflags": "+faststart"}) as output:
             video_out = output.add_stream(encoder, rate=rate, options=encoder_options(encoder, bitrate))
@@ -224,7 +289,7 @@ def transcode(source_path, destination, width, height, in_fov, interp, codec, en
             video_out.time_base = video_time_base
             audio_out = output.add_stream_from_template(audio) if audio is not None else None
 
-            queues = {first.index: deque(), second.index: deque()}
+            queues = {stream.index: deque() for stream in video_streams}
             pending_audio = deque()
             state = {"frames": 0, "started": time.monotonic()}
 
@@ -234,9 +299,7 @@ def transcode(source_path, destination, width, height, in_fov, interp, codec, en
                     output.mux(packet)
 
             def emit():
-                stacked = stack_lenses(
-                    queues[first.index].popleft(), queues[second.index].popleft(), front_track
-                )
+                stacked = combine()
                 index = state["frames"]
                 equirect = reprojector.convert(stacked, index)
                 for packet in video_out.encode(equirect):
@@ -254,7 +317,7 @@ def transcode(source_path, destination, width, height, in_fov, interp, codec, en
                         tail = f"  预计剩余 {remaining / 60:.1f} 分钟"
                     print(f"  已转 {progress} 帧  {done_seconds:.1f}s  {speed:.2f} fps{tail}", flush=True)
 
-            wanted = (first, second) + ((audio,) if audio is not None else ())
+            wanted = video_streams + ((audio,) if audio is not None else ())
             for packet in container.demux(*wanted):
                 if packet.stream is audio:
                     if audio_out is not None and packet.dts is not None:
@@ -264,7 +327,7 @@ def transcode(source_path, destination, width, height, in_fov, interp, codec, en
                     continue
                 for frame in packet.decode():
                     queues[packet.stream.index].append(frame)
-                while queues[first.index] and queues[second.index]:
+                while ready():
                     emit()
                     if limit_frames is not None and state["frames"] >= limit_frames:
                         break
@@ -358,7 +421,7 @@ def parser():
         "镜头交界处会有可见的不连续，输出也不带球面（ST3D/SV3D）元数据。"
         "需要官方品质的成片时，请走 tools/x4_export.py 的 Media SDK 路线。"
     ))
-    result.add_argument("source", help="X4 Air 录制的 .insv 文件")
+    result.add_argument("source", help="X4 Air 的 .insv（双轨方形鱼眼）或并排双鱼眼的 .lrv 代理")
     result.add_argument("-o", "--output", help="输出 MP4 路径（默认与源文件同目录，文件名加 _360_unofficial）")
     result.add_argument("--size", default=DEFAULT_SIZE, help=f"输出尺寸，必须 2:1（默认 {DEFAULT_SIZE}）")
     result.add_argument("--in-fov", type=float, default=DEFAULT_IN_FOV,

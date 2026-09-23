@@ -1,4 +1,4 @@
-"""Bounded session-local apparent-size tracking; this is not metric depth or TTC."""
+﻿"""Bounded session-local apparent-size tracking; this is not metric depth or TTC."""
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import math
