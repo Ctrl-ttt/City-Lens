@@ -14,9 +14,12 @@ from .models import AnalyzeInput, Observation
 from .vision import VisionError
 
 FACE_SIZE = 384
+READ_FACE_SIZE = 640
 HEADER = 24
 FACES = {'front': (0, 0), 'left': (-90, 0), 'right': (90, 0),
          'back': (180, 0), 'up': (0, 90), 'down': (0, -90)}
+READ_FACES = {'front_left': (-45, 0), 'front': (0, 0), 'front_right': (45, 0)}
+VIEW_ANGLES = {**FACES, **READ_FACES}
 PANORAMA_INSTRUCTION = '''输入是程序生成的六宫格透视图，不是普通照片。上排依次 front,left,right；下排 back,up,down。
 每个格子顶部英文是程序标签，不是场景标牌。只输出label和box；标牌另有text和clarity。不要输出direction、view或category，方向由代码计算。
 box必须相对整张输入图归一化到0-1000，不能相对单格；框住一个格子内的目标主体，不可跨格子。无法准确给框的目标不要输出。
@@ -28,10 +31,12 @@ box必须相对整张输入图归一化到0-1000，不能相对单格；框住�
 
 def normalize_atlas_events(events: list, mode: str) -> list:
     """Model grounds in the whole atlas; code alone assigns the face and local box."""
-    names = ['front'] if mode == 'read' else list(FACES)
-    size = 768 if mode == 'read' else FACE_SIZE
-    width = size if mode == 'read' else size*3
-    height = size+HEADER if mode == 'read' else (size+HEADER)*2
+    names = list(READ_FACES) if mode == 'read' else list(FACES)
+    size = READ_FACE_SIZE if mode == 'read' else FACE_SIZE
+    columns = 3
+    rows = 1 if mode == 'read' else 2
+    width = size * columns
+    height = (size + HEADER) * rows
     grounded = []
     for event in events:
         if not isinstance(event, dict):
@@ -42,8 +47,8 @@ def normalize_atlas_events(events: list, mode: str) -> list:
         if not (0 <= box[0] < box[2] <= 1000 and 0 <= box[1] < box[3] <= 1000):
             continue
         x1,y1,x2,y2 = box[0]*width/1000,box[1]*height/1000,box[2]*width/1000,box[3]*height/1000
-        col = min(2,int((x1+x2)/2/size)) if mode=='walk' else 0
-        row = min(1,int((y1+y2)/2/(size+HEADER))) if mode=='walk' else 0
+        col = min(columns - 1, int((x1+x2)/2/size))
+        row = min(rows - 1, int((y1+y2)/2/(size+HEADER)))
         left,top = col*size,row*(size+HEADER)+HEADER
         clipped = [max(x1,left),max(y1,top),min(x2,left+size),min(y2,top+size)]
         if ((clipped[2]-clipped[0])*(clipped[3]-clipped[1]) < (x2-x1)*(y2-y1)*0.85
@@ -62,13 +67,13 @@ def prepare_panorama(data: bytes, meta: AnalyzeInput) -> bytes:
         if abs(image.width / image.height - 2) > 0.04 or image.width < 640:
             raise VisionError('invalid_panorama')
         pixels = np.asarray(image.convert('RGB'))
-    faces = ['front'] if meta.mode == 'read' else list(FACES)
-    size = 768 if meta.mode == 'read' else FACE_SIZE
-    atlas = Image.new('RGB', (size * (1 if len(faces) == 1 else 3),
-                             (size + HEADER) * (1 if len(faces) == 1 else 2)))
+    view_angles = READ_FACES if meta.mode == 'read' else FACES
+    faces = list(view_angles)
+    size = READ_FACE_SIZE if meta.mode == 'read' else FACE_SIZE
+    atlas = Image.new('RGB', (size * 3, (size + HEADER) * (1 if meta.mode == 'read' else 2)))
     draw = ImageDraw.Draw(atlas)
     for i, name in enumerate(faces):
-        yaw, pitch = FACES[name]
+        yaw, pitch = view_angles[name]
         yaw = (yaw + meta.heading_deg + 180) % 360 - 180
         # The library caches the sampling grid; subsequent frames only resample.
         face = py360convert.e2p(pixels, 90, yaw, pitch, (size, size), mode='bilinear')
@@ -76,13 +81,13 @@ def prepare_panorama(data: bytes, meta: AnalyzeInput) -> bytes:
         atlas.paste(Image.fromarray(face), (x, y + HEADER))
         draw.text((x + 8, y + 5), name.upper(), fill='white')
     out = io.BytesIO()
-    atlas.save(out, format='JPEG', quality=80)
+    atlas.save(out, format='JPEG', quality=88 if meta.mode == 'read' else 80)
     return out.getvalue()
 
 
 def face_ray(view: str, x: float, y: float) -> np.ndarray:
     """Unit ray for a 90-degree face; x/y use local 0..1000 coordinates."""
-    yaw, pitch = map(math.radians, FACES[view])
+    yaw, pitch = map(math.radians, VIEW_ANGLES[view])
     # Forward/right/up basis: positive yaw is to the right; positive pitch is up.
     forward = np.array([math.sin(yaw)*math.cos(pitch), math.sin(pitch), math.cos(yaw)*math.cos(pitch)])
     right = np.array([math.cos(yaw), 0, -math.sin(yaw)])
@@ -93,7 +98,7 @@ def face_ray(view: str, x: float, y: float) -> np.ndarray:
 
 def angular_span(event: Observation, axis: int) -> float | None:
     """Angular box extent, comparable across horizontal faces (not metric size)."""
-    if event.view not in FACES or not event.box:
+    if event.view not in VIEW_ANGLES or not event.box:
         return None
     x1, y1, x2, y2 = event.box
     if axis == 0:
@@ -107,7 +112,7 @@ def angular_span(event: Observation, axis: int) -> float | None:
 
 def bearing(event: Observation) -> tuple[float, float] | None:
     """Map a perspective face's local center to panorama-relative yaw/pitch."""
-    if event.view not in FACES:
+    if event.view not in VIEW_ANGLES:
         return None
     x, y = ((event.box[0] + event.box[2]) / 2, (event.box[1] + event.box[3]) / 2) if event.box else (500, 500)
     ray = face_ray(event.view, x, y)

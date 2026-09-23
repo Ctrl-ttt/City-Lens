@@ -10,7 +10,7 @@ from PIL import Image
 
 from backend.app import create_app
 from backend.models import AnalyzeInput, Observation, SpatialObservation, VisionResult
-from backend.panorama import FACE_SIZE, HEADER, FACES, angular_span, bearing, direction_from_bearing, prepare_panorama
+from backend.panorama import FACE_SIZE, READ_FACE_SIZE, HEADER, FACES, angular_span, bearing, direction_from_bearing, prepare_panorama
 from backend.rules import summarize
 from backend.spatial import SpatialSessions, compatible
 from backend.vision import Settings, VisionError, parse_result
@@ -47,6 +47,26 @@ def test_panorama_faces_have_expected_cardinal_colors_and_heading():
         assert np.max(np.abs(actual.astype(int)-expected)) < 8
     shifted = np.asarray(Image.open(io.BytesIO(prepare_panorama(jpeg(pixels), meta(heading_deg=90)))))
     assert shifted[HEADER+FACE_SIZE//2, FACE_SIZE//2, 2] > 240
+
+
+def test_read_panorama_uses_three_overlapping_front_views():
+    pixels = np.zeros((480, 960, 3), dtype=np.uint8)
+    pixels[:, 330:390] = [255, 0, 0]  # -45 degrees
+    pixels[:, 450:510] = [0, 255, 0]  # 0 degrees
+    pixels[:, 570:630] = [0, 0, 255]  # +45 degrees
+    read_meta = AnalyzeInput(session_id='panorama-test', frame_id=1, mode='read', source='video',
+                             projection='equirectangular')
+    atlas = np.asarray(Image.open(io.BytesIO(prepare_panorama(jpeg(pixels), read_meta))))
+    assert atlas.shape[:2] == (READ_FACE_SIZE + HEADER, READ_FACE_SIZE * 3)
+    centers = [atlas[HEADER + READ_FACE_SIZE//2, i*READ_FACE_SIZE + READ_FACE_SIZE//2] for i in range(3)]
+    assert centers[0][0] > 240 and centers[1][1] > 240 and centers[2][2] > 240
+
+
+def test_read_atlas_box_keeps_overlapping_view_provenance():
+    result = parse_result('{"events":[{"label":"sign","box":[100,200,230,700],"text":"测试牌","clarity":"high"}]}',
+                          panorama=True, mode='read')
+    assert result.events[0].view == 'front_left'
+    assert direction_from_bearing(*bearing(result.events[0])) == 'left'
 
 
 @pytest.mark.parametrize('view,expected', [('front','front'),('left','left'),('right','right'),('back','back'),('up','above')])

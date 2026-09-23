@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Mode = Literal['walk', 'read']
 Source = Literal['camera', 'video']
 Projection = Literal['rectilinear', 'equirectangular']
-View = Literal['front', 'left', 'right', 'back', 'up', 'down']
+View = Literal['front', 'left', 'right', 'back', 'up', 'down', 'front_left', 'front_right']
 LABELS = {
     'person': ('obstacle', '行人'),
     'car': ('obstacle', '车辆'),

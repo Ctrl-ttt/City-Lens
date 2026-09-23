@@ -6,11 +6,13 @@ declare global {
 }
 const health: Health = { status: 'ok', provider: 'realtime', model: 'realtime-test', configured: true, sample_scene: null, http_model: 'http-test', http_configured: true, realtime_model: 'realtime-test', realtime_configured: true };
 type Connection = { route: WebSocketRoute; frames: RealtimeFrame[]; closed: boolean };
-function respond(connection: Connection, frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text = '右侧发现楼梯') {
-  connection.route.send(JSON.stringify({ type: 'result', ...analysis(frame, text) }));
+function respond(connection: Connection, frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text = '右侧发现楼梯', grounded = true) {
+  connection.route.send(JSON.stringify({ type: 'result', ...analysis(frame, text, grounded) }));
 }
-function analysis(frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text: string) {
-  return { session_id: frame.session_id, frame_id: frame.frame_id, status: 'ok', events: [{ category: 'obstacle', label: 'stairs', direction: 'right', text }], speech: { key: text, priority: 'normal', text }, latency_ms: 100 };
+function analysis(frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text: string, grounded = true) {
+  const event = { category: 'obstacle', label: 'stairs', direction: 'right', text,
+    ...(grounded ? { box: [400, 300, 600, 700] as [number, number, number, number] } : {}) };
+  return { session_id: frame.session_id, frame_id: frame.frame_id, status: 'ok', events: [event], speech: { key: 'stairs:right', priority: 'normal', text }, latency_ms: 100 };
 }
 function signAnalysis(frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text = '测试路', direction: Analysis['events'][number]['direction'] = 'front', clarity: 'high' | 'medium' = 'high'): Analysis {
   // Server fixtures use already-normalized text; direction/clarity never enter the speech key.
@@ -295,7 +297,7 @@ test('default channel, consent, eight-second ready gate, real canvas/TTS, pause 
   await expect(state(page)).toHaveText('实时连接：已连接');
   expect(await page.evaluate(() => window.__spoken)).toEqual(['右侧发现楼梯']);
   const frame = connections[0].frames[0];
-  expect(Object.keys(frame).sort()).toEqual(['frame_id', 'image', 'mode', 'session_id', 'source', 'type']);
+  expect(Object.keys(frame).sort()).toEqual(['frame_id', 'image', 'mode', 'session_id', 'source', 'speech_detail_level', 'speech_threshold', 'type']);
   expect(frame).toMatchObject({ type: 'frame', mode: 'walk', source: 'camera', frame_id: 1 });
   expect(frame.image.length).toBeLessThanOrEqual(256 * 1024);
   expect(Buffer.from(frame.image, 'base64').subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
@@ -533,7 +535,9 @@ test('single-frame keypress sends once while awaiting analysis and closes after 
   expect(connections[0].frames).toHaveLength(1);
   expect(await page.evaluate(() => window.__captures)).toBe(1);
   respond(connections[0], connections[0].frames[0]);
-  await expect(caption(page)).toHaveText('右侧发现楼梯');
+  await expect(page.locator('.prediction-audit')).toContainText('预测已取消旧播报');
+  await expect(page.locator('.event-list .event strong')).toHaveText(['右侧发现楼梯']);
+  expect(await page.evaluate(() => window.__spoken)).toEqual([]);
   await expect.poll(() => connections[0].closed).toBe(true);
   await expect(state(page)).toHaveText('实时连接：已断开');
   await page.clock.runFor(10000);
@@ -573,7 +577,7 @@ test('disconnect clears speech/results and recovery captures a new frame, with a
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeVisible();
 });
 
-test('progress watchdog expires despite continuous sends; stale walk results never display or speak', async ({ page }) => {
+test('progress watchdog accepts transport progress but stale ungrounded obstacles never speak', async ({ page }) => {
   await page.clock.install({ time: new Date('2026-01-01T12:00:00Z') });
   await page.clock.pauseAt(new Date('2026-01-01T12:00:01Z'));
   const { connections } = await setup(page, { results: false });
@@ -581,9 +585,9 @@ test('progress watchdog expires despite continuous sends; stale walk results nev
   await expect.poll(() => connections[0]?.frames.length).toBe(1);
   await page.clock.runFor(6100);
   await expect.poll(() => connections[0].frames.length).toBe(7);
-  respond(connections[0], connections[0].frames[0], '过期画面');
-  await expect(page.getByRole('alert')).toContainText('结果已过期');
-  await expect(page.locator('.event-list')).toBeEmpty();
+  respond(connections[0], connections[0].frames[0], '过期画面', false);
+  await expect(page.locator('.prediction-audit')).toContainText('预测已取消旧播报');
+  await expect(page.locator('.event-list')).not.toBeEmpty();
   await expect(page.getByRole('button', { name: '重播上一条' })).toBeDisabled();
   expect(await page.evaluate(() => window.__spoken)).toEqual([]);
   // Valid transport progress renews the deadline even if too old for UI/TTS.

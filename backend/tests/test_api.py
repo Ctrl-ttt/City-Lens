@@ -50,6 +50,8 @@ def test_empty_and_unclear(scene, mode, status, event_count, speech):
         result = analyze(client, mode).json()
         assert result['status'] == status
         assert len(result['events']) == event_count
+        if event_count:
+            assert [event['label'] for event in result['events']] == ['sign']
         assert (result['speech']['text'] if result['speech'] else None) == speech
 
 

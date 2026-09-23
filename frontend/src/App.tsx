@@ -373,7 +373,7 @@ export default function App() {
     }
     if (manual) return { data, audit: base('unused', '预测未参与播报', '手动看牌使用原始画面结果。') };
     if (projection !== 'rectilinear') return { data, audit: base('unused', '预测未参与播报', '全景模式使用服务端方向判断。') };
-    if (ageMs < 120) return { data, audit: base('unused', '无需延迟补偿', '结果返回很快，直接使用原始播报。') };
+    if (ageMs < 1000) return { data, audit: base('unused', '无需延迟补偿', '结果在一秒内返回，直接使用原始播报。') };
     const spokenPrefixes = new Set((data.speech?.key ?? '').split('|').map(key => key.replace(/:(?:approaching|near)$/, '')));
     if (!reference) return { data, audit: base('unused', '预测不可用', '没有找到发送时的本地参考帧，结果未做位置校正。') };
     const current = video.current && snapshotVideo(video.current, sourceRef.current === 'camera');
@@ -385,9 +385,12 @@ export default function App() {
     let allSpokenObstaclesTracked = true, allSpokenObstaclesRelevant = true;
     let matched = 0, attempted = 0, directionChanges = 0, longestTrack = 0;
     const events = data.events.map(event => {
-      if (!event.box) return event;
-      attempted++;
       const spoken = spokenPrefixes.has(`${event.label}:${event.direction}`);
+      if (!event.box) {
+        if (spoken && event.category === 'obstacle') allSpokenObstaclesTracked = false;
+        return event;
+      }
+      attempted++;
       const trajectory = trackTrajectory(reference, event.box, capturedAt, frames, 2.5);
       if (!trajectory) {
         if (spoken && event.category === 'obstacle') allSpokenObstaclesTracked = false;
@@ -408,7 +411,7 @@ export default function App() {
     // A late obstacle warning is withheld if its labelled region has disappeared
     // or cannot be uniquely located in the newest frame.  Text-only reads remain
     // governed by their separate manual freshness budget.
-    const lateObstacleSpeech = !!data.speech && data.events.some(event => event.category === 'obstacle' && !!event.box
+    const lateObstacleSpeech = !!data.speech && data.events.some(event => event.category === 'obstacle'
       && spokenPrefixes.has(`${event.label}:${event.direction}`));
     const blocked = lateObstacleSpeech && (!allSpokenObstaclesTracked || !allSpokenObstaclesRelevant);
     let speech = blocked ? null : data.speech;
@@ -465,6 +468,7 @@ export default function App() {
       }
       return;
     }
+    if (requestedMode === 'walk' && Date.now() < cooldownUntil.current) return;
     // HTTP (including manual reading) remains strictly single-flight.  During a
     // slow request retain one latest-frame request instead of silently dropping
     // every timer tick.  The actual capture happens in the finally continuation
@@ -532,7 +536,8 @@ export default function App() {
       const nextMode = pendingHttpMode.current;
       pendingHttpMode.current = null;
       if (nextMode && gate.current.current(ticket) && active.current && !readingRef.current
-          && channelRef.current === 'http' && !document.hidden) {
+          && channelRef.current === 'http' && !document.hidden && Date.now() >= cooldownUntil.current
+          && httpPacer.current.ready(Date.now())) {
         void analyze(nextMode);
       }
     }

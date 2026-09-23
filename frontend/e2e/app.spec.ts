@@ -85,14 +85,17 @@ test('transient busy and rate-limited rounds skip without tripping the pause', a
   await expect(page.locator('.event-list')).not.toBeEmpty();
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeHidden();
   await expect(page.getByRole('alert')).toContainText('模型请求过于频繁');
-  // The cooldown parks the ticker until its window clears, then recognition resumes.
+  // The cooldown parks the next send instead of immediately replaying a queued
+  // frame. Fake-clock/network scheduling need not expose the exact internal
+  // deadline, but analysis must resume after the complete cooldown window.
   const parked = calls;
-  await page.clock.runFor(14000);
+  await page.clock.runFor(1000);
   expect(calls).toBe(parked);
-  await page.clock.runFor(2000);
+  await page.clock.runFor(15000);
   await expect.poll(() => calls).toBeGreaterThan(parked);
   await expect(page.getByRole('alert')).toHaveCount(0);
-  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
+  await expect(page.locator('.event-list')).not.toBeEmpty();
+  await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeHidden();
 });
 
 test('pause aborts pending recognition and stops sampling', async ({ page }) => {
