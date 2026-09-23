@@ -8,7 +8,6 @@ import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from '.
 import { captureRealtimeFrame, RealtimeClient } from './realtime';
 import { FOOD_DETAIL_STORAGE, foodDetailNames, loadFoodDetail, buildFoodSpeech } from './food';
 import cityLensMark from './assets/citylens-mark.svg';
-import Link2Controls from './Link2Controls';
 import { PanoramaObserver, type PanoramaAnchor } from './panoramaObserver';
 import { PanoramaDiagnostics, PanoramaOverlay, useTrackingFreshness } from './PanoramaDiagnostics';
 import { projectFaceBox, type TrackingSnapshot, type PanoramaTrack } from './panoramaTracking';
@@ -46,7 +45,6 @@ export default function App() {
   const [trackingError, setTrackingError] = useState('');
   const [overlayTracks, setOverlayTracks] = useState<PanoramaTrack[]>([]);
   const trackingFreshness = useTrackingFreshness(tracking);
-  const [cameraControlBusy, setCameraControlBusy] = useState(false);
   const [channel, setChannel] = useState<Channel>('http');
   const [connectionState, setConnectionState] = useState<RealtimeState>('waiting');
   const internalSeek = useRef(false);
@@ -693,7 +691,6 @@ export default function App() {
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
           <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><button disabled={connecting} onClick={() => void previewCamera()}>仅本地预览</button><small>{activeCameraLabel ? `当前输入：${activeCameraLabel}` : '支持 USB / 全景摄像头'} · 仅本地预览不会上传画面</small></>}</div>
-          {source === 'camera' && <Link2Controls activeLabel={activeCameraLabel} cameraLabels={devices.map(d => d.label)} beforeControl={() => invalidate('相机画面正在调整，识别已暂停。确认画面稳定后重新开始。')} onControlBusyChange={(pending: boolean) => setCameraControlBusy(pending)} />}
           {projection === 'equirectangular' && <PanoramaDiagnostics enabled={trackingEnabled} onToggle={toggleTracking} snapshot={tracking} error={trackingError} {...trackingFreshness} sample={health?.provider === 'sample'} />}
           {projection === 'equirectangular' && source === 'video' && <ImuDiagnostics video={video} videoFile={videoFile} />}
         </section>
