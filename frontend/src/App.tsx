@@ -8,6 +8,11 @@ import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from '.
 import { captureRealtimeFrame, RealtimeClient } from './realtime';
 import { FOOD_DETAIL_STORAGE, foodDetailNames, loadFoodDetail, buildFoodSpeech } from './food';
 import cityLensMark from './assets/citylens-mark.svg';
+import Link2Controls from './Link2Controls';
+import { PanoramaObserver, type PanoramaAnchor } from './panoramaObserver';
+import { PanoramaDiagnostics, PanoramaOverlay, useTrackingFreshness } from './PanoramaDiagnostics';
+import { projectFaceBox, type TrackingSnapshot, type PanoramaTrack } from './panoramaTracking';
+import { ImuDiagnostics } from './ImuDiagnostics';
 import './brand.css';
 
 const sourceNames = { camera: '实时摄像头', video: '路线视频回放' };
@@ -26,12 +31,22 @@ export default function App() {
   const stream = useRef<MediaStream | null>(null);
   const objectUrl = useRef<string | null>(null);
   const gate = useRef(new SessionGate());
+  const readGate = useRef(new SessionGate());
   const active = useRef(false);
   const sourceRef = useRef<Source>('camera');
   const channelRef = useRef<Channel>('http');
   const realtime = useRef<RealtimeClient | null>(null);
   const healthRef = useRef<Health | null>(null);
   const mounted = useRef(false);
+  const observer = useRef<PanoramaObserver | null>(null);
+  const trackingEnabledRef = useRef(false);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [trackingEnabled, setTrackingEnabled] = useState(false);
+  const [tracking, setTracking] = useState<TrackingSnapshot | null>(null);
+  const [trackingError, setTrackingError] = useState('');
+  const [overlayTracks, setOverlayTracks] = useState<PanoramaTrack[]>([]);
+  const trackingFreshness = useTrackingFreshness(tracking);
+  const [cameraControlBusy, setCameraControlBusy] = useState(false);
   const [channel, setChannel] = useState<Channel>('http');
   const [connectionState, setConnectionState] = useState<RealtimeState>('waiting');
   const internalSeek = useRef(false);
@@ -83,7 +98,7 @@ export default function App() {
   const [speechThreshold, setSpeechThreshold] = useState(70);
   const [speechDetail, setSpeechDetail] = useState<SpeechDetailLevel>('medium');
 
-  if (!queue.current) queue.current = new SpeechQueue(browserVoiceDriver(() => setVoiceError('语音播放失败，请检查系统中文语音和输出设备。')), () => gate.current.session);
+  if (!queue.current) queue.current = new SpeechQueue(browserVoiceDriver(() => setVoiceError('语音播放失败，请检查系统中文语音和输出设备。')), () => [gate.current.session, readGate.current.session]);
 
   async function checkHealth() {
     try {
@@ -109,11 +124,19 @@ export default function App() {
     client?.close();
     if (client) setConnectionState('disconnected');
   }
+  function clearTracking() {
+    observer.current?.dispose(); observer.current = null;
+    setTracking(null); setTrackingError(''); setOverlayTracks([]);
+  }
+  function toggleTracking(enabled: boolean) {
+    trackingEnabledRef.current = enabled; setTrackingEnabled(enabled); clearTracking();
+  }
   function clearResults() {
     queue.current?.clear(); last.current = null;
     motionFrames.current.clear();
     frameHistory.current.clear();
     setResult(null); setFoodResult(null); setHistory([]); setRoundtrip(0); setPredictionAudit(null);
+    clearTracking();
   }
   function invalidate(message?: string) {
     httpPacer.current.reset();
@@ -140,7 +163,7 @@ export default function App() {
     invalidate('输入已切换，请重新开始'); releaseCamera();
     if (video.current) { video.current.pause(); video.current.removeAttribute('src'); video.current.load(); }
     if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
-    objectUrl.current = null; setFileName(''); setReady(false); setError('');
+    objectUrl.current = null; setFileName(''); setVideoFile(null); setReady(false); setError('');
     sourceRef.current = next; setSource(next);
     setProjection('rectilinear'); setHeading(0);
   }
@@ -583,7 +606,7 @@ export default function App() {
     if (!file) return;
     invalidate('视频已选择，请开始识别'); releaseCamera(); setError(''); setReady(false);
     if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
-    objectUrl.current = URL.createObjectURL(file); setFileName(file.name);
+    objectUrl.current = URL.createObjectURL(file); setFileName(file.name); setVideoFile(file);
     video.current!.src = objectUrl.current; video.current!.load();
   }
   function replay() {
@@ -665,10 +688,14 @@ export default function App() {
                 </g>;
               })}
             </svg>}
+            {projection === 'equirectangular' && (trackingEnabled && tracking || overlayTracks.length > 0) && <PanoramaOverlay snapshot={trackingEnabled && tracking ? tracking : undefined} tracks={!trackingEnabled || !tracking ? overlayTracks : undefined} fresh={trackingFreshness.fresh} aspect={video.current?.videoWidth && video.current.videoHeight ? video.current.videoWidth / video.current.videoHeight : 2} />}
             {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true">{source === 'camera' ? <Camera/> : <FileVideo/>}</div><h3>{source==='camera' ? '摄像头尚未开启' : '尚未选择路线视频'}</h3><p>{source==='camera' ? '可先仅本地预览，确认画面后开始识别' : '选择本地 MP4 后开始识别'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
           <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><button disabled={connecting} onClick={() => void previewCamera()}>仅本地预览</button><small>{activeCameraLabel ? `当前输入：${activeCameraLabel}` : '支持 USB / 全景摄像头'} · 仅本地预览不会上传画面</small></>}</div>
+          {source === 'camera' && <Link2Controls activeLabel={activeCameraLabel} cameraLabels={devices.map(d => d.label)} beforeControl={() => invalidate('相机画面正在调整，识别已暂停。确认画面稳定后重新开始。')} onControlBusyChange={(pending: boolean) => setCameraControlBusy(pending)} />}
+          {projection === 'equirectangular' && <PanoramaDiagnostics enabled={trackingEnabled} onToggle={toggleTracking} snapshot={tracking} error={trackingError} {...trackingFreshness} sample={health?.provider === 'sample'} />}
+          {projection === 'equirectangular' && source === 'video' && <ImuDiagnostics video={video} videoFile={videoFile} />}
         </section>
         <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 6 项 · 当前档位最多 {speechDetail === 'low' ? 3 : speechDetail === 'medium' ? 2 : 1} 项播报</span></div>
           <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{event.direction_predicted && event.original_direction ? `${directionNames[event.original_direction]}→` : ''}{directionNames[event.direction]}{event.approaching ? " · 疑似靠近" : ""}{event.speed_level && event.speed_level !== 'unknown' ? ` · ${event.speed_level === 'fast' ? '快速' : event.speed_level === 'medium' ? '中速' : '缓慢'}接近` : ""}{event.proximity && event.proximity !== "unknown" ? ` · 本地粗估${{near:"较近",mid:"中距",far:"较远"}[event.proximity]}` : ""}{event.motion_compensated ? ` · 连续跟踪${event.motion_samples ?? 0}帧` : ""}</span></div>)}</div>
