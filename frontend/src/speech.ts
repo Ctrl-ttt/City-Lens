@@ -10,9 +10,9 @@ export class SpeechQueue {
   private spoken = new Map<string, number>();
   private generation = 0;
   private muted = false;
-  constructor(private driver: VoiceDriver, private session: () => string, private now = () => Date.now()) {}
+  constructor(private driver: VoiceDriver, private session: () => string[], private now = () => Date.now()) {}
   private valid(c: Candidate) {
-    return !this.muted && c.session === this.session() && this.now() - c.capturedAt <= c.maxAge;
+    return !this.muted && this.session().includes(c.session) && this.now() - c.capturedAt <= c.maxAge;
   }
   offer(c: Candidate) {
     if (!this.valid(c)) return;

@@ -6,7 +6,7 @@ function setup() {
   let session = 's';
   const completions: (() => void)[] = [];
   const driver = { speak: vi.fn((_text: string, done: () => void) => completions.push(done)), cancel: vi.fn() };
-  const queue = new SpeechQueue(driver, () => session, () => time);
+  const queue = new SpeechQueue(driver, () => [session], () => time);
   const candidate = (key: string, priority: Candidate['priority'] = 'low'): Candidate => ({ key, text: key, priority, session, capturedAt: time, maxAge: 6000 });
   return { queue, driver, completions, candidate, tick: (n: number) => { time = n; }, session: (s: string) => { session = s; } };
 }

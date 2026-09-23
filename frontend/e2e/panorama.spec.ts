@@ -34,7 +34,7 @@ test('stitched panorama reaches actual local projection API and heading starts a
     const original = window.fetch;
     (window as unknown as { panoramaFields: Record<string, string>[] }).panoramaFields = [];
     window.fetch = (input, init) => {
-      if (input === '/api/analyze' && init?.body instanceof FormData) {
+      if (input === '/api/walk' && init?.body instanceof FormData) {
         const fields: Record<string,string> = {};
         init.body.forEach((value, key) => { if (typeof value === 'string') fields[key] = value; });
         (window as unknown as { panoramaFields: Record<string,string>[] }).panoramaFields.push(fields);
@@ -62,7 +62,7 @@ test('changing panorama format invalidates a delayed previous result', async ({ 
   await page.goto('/'); await panoramaVideo(page);
   let release!: () => void; const barrier = new Promise<void>(resolve => { release = resolve; });
   let arrived!: () => void; const seen = new Promise<void>(resolve => { arrived = resolve; });
-  await page.route('**/api/analyze', async route => {
+  await page.route('**/api/walk', async route => {
     const response = await route.fetch(); arrived(); await barrier;
     await route.fulfill({ response });
   });
