@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 *.tsbuildinfo
 node_modules/
+tools/linkctl/obj/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
@@ -15,4 +16,10 @@ work/
 release/
 *.log
 .DS_Store
+native/link2/build/
 
+test/
+*.insv
+*.mp4
+.pnpm-store/
+vibe_images/

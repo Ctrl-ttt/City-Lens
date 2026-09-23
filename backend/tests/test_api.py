@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import io
 import json
 
@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from backend.app import create_app
-from backend.vision import Settings
+from backend.vision import READ_INSTRUCTION, SYSTEM_PROMPT, WALK_INSTRUCTION, Settings
 
 
 def jpeg():
@@ -28,27 +28,28 @@ def test_sample_contract_and_health():
         health = client.get('/api/health').json()
         assert health['provider'] == 'sample'
         assert health['model'] == 'fixed-sample'
+        assert health['camera_hfov_deg'] == 75.0
         response = analyze(client)
         assert response.status_code == 200
         assert response.headers['cache-control'] == 'no-store'
         result = response.json()
         assert (result['session_id'], result['frame_id']) == ('test-session', 1)
-        assert result['speech']['text'] == '右前方发现自行车'
-        assert result['speech']['priority'] == 'high'
-        assert analyze(client, 'read').json()['speech']['text'].startswith('标牌文字：样例牌')
+        assert result['speech'] is None
+        assert result['events'] == []
+        assert analyze(client, 'read').json()['speech'] is not None
 
 
-@pytest.mark.parametrize('scene,mode,status,speech', [
-    ('empty', 'walk', 'ok', None),
-    ('unclear', 'walk', 'uncertain', None),
-    ('empty', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
-    ('unclear', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
+@pytest.mark.parametrize('scene,mode,status,event_count,speech', [
+    ('empty', 'walk', 'ok', 0, None),
+    ('unclear', 'walk', 'uncertain', 0, None),
+    ('empty', 'read', 'ok', 1, '标牌文字：样例牌：城市图书馆'),
+    ('unclear', 'read', 'uncertain', 0, '文字看不清，请调整拍摄角度'),
 ])
-def test_empty_and_unclear(scene, mode, status, speech):
+def test_empty_and_unclear(scene, mode, status, event_count, speech):
     with TestClient(create_app(Settings(provider='sample', sample_scene=scene))) as client:
         result = analyze(client, mode).json()
         assert result['status'] == status
-        assert result['events'] == []
+        assert len(result['events']) == event_count
         assert (result['speech']['text'] if result['speech'] else None) == speech
 
 
@@ -75,10 +76,85 @@ def test_live_adapter_sends_image_and_uses_validated_rules():
         assert request.url.path.endswith('/chat/completions')
         payload = json.loads(request.content)
         assert payload['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/jpeg;base64,')
-        content = {'events': [{'category': 'obstacle', 'label': 'bicycle', 'direction': 'left', 'text': '现在可以过马路'}]}
+        content = {'events': [{'category': 'obstacle', 'label': 'obstacle', 'direction': 'front', 'text': '现在可以过马路'}]}
         return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(content)}}]})
     with TestClient(create_app(Settings(api_key='test-only'), httpx.MockTransport(handler))) as client:
-        assert analyze(client).json()['speech']['text'] == '左前方发现自行车'
+        assert analyze(client).json()['speech']['text'] == '前方发现障碍物'
+
+
+@pytest.mark.parametrize('mode', ['walk', 'read'])
+@pytest.mark.parametrize('clarity', ['high', 'medium', 'low'])
+def test_http_sign_contract_prompt_and_filtering(mode, clarity, caplog):
+    text = '测试路 12号'
+
+    def handler(request):
+        payload = json.loads(request.content)
+        assert payload['messages'][0]['content'] == SYSTEM_PROMPT
+        assert payload['messages'][1]['content'][0]['text'] == (
+            WALK_INSTRUCTION if mode == 'walk' else READ_INSTRUCTION)
+        content = {'events': [{'category': 'text', 'label': 'sign', 'direction': 'right',
+                              'text': text, 'clarity': clarity}]}
+        return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(content)}}]})
+
+    with TestClient(create_app(Settings(api_key='test-only'), httpx.MockTransport(handler))) as client:
+        response = analyze(client, mode)
+        assert response.status_code == 200
+        result = response.json()
+        if mode == 'walk':
+            assert result['status'] == 'ok'
+            assert result['events'] == []
+            assert result['speech'] is None
+        elif clarity == 'low':
+            assert result['events'] == []
+            assert (result['speech']['key'] if result['speech'] else None) == 'unclear'
+        else:
+            assert result['status'] == 'ok'
+            assert result['events'][0]['clarity'] == clarity
+            assert result['speech'] == {'key': f'sign:{text}', 'priority': 'normal', 'text': f'标牌文字：{text}'}
+        assert text not in caplog.text
+
+
+@pytest.mark.parametrize('mode', ['walk', 'read'])
+def test_http_mixed_scene_keeps_obstacle_priority_and_read_is_text_only(mode):
+    content = {'events': [
+        {'category': 'facility', 'label': 'entrance', 'direction': 'front', 'text': ''},
+        {'category': 'text', 'label': 'sign', 'direction': 'left', 'text': '较小标牌', 'clarity': 'medium'},
+        {'category': 'text', 'label': 'sign', 'direction': 'right', 'text': '清晰标牌', 'clarity': 'high'},
+        {'category': 'obstacle', 'label': 'stairs', 'direction': 'front', 'text': ''},
+    ]}
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, json={'choices': [{'message': {'content': json.dumps(content)}}]}))
+    with TestClient(create_app(Settings(api_key='test-only'), transport)) as client:
+        result = analyze(client, mode).json()
+    if mode == 'walk':
+        assert [e['text'] for e in result['events']] == ['楼梯', '出入口']
+        assert result['speech'] == {'key': 'stairs:front', 'priority': 'high', 'text': '前方发现楼梯'}
+    else:
+        assert [e['text'] for e in result['events']] == ['清晰标牌']
+        assert result['speech']['text'] == '标牌文字：清晰标牌'
+
+
+def test_read_mode_can_use_a_dedicated_stronger_model():
+    seen = []
+    def handler(request):
+        seen.append(json.loads(request.content)['model'])
+        return httpx.Response(200, json={'choices': [{'message': {'content': '{"events":[]}'}}]})
+    config = Settings(api_key='test-only', model='fast-model', read_model='strong-model')
+    with TestClient(create_app(config, httpx.MockTransport(handler))) as client:
+        assert analyze(client, 'walk').status_code == 200
+        assert analyze(client, 'read').status_code == 200
+    assert seen == ['fast-model', 'strong-model']
+
+
+def test_walk_sample_sign_is_never_read_without_read_mode():
+    with TestClient(create_app(Settings(provider='sample', sample_scene='sign'))) as client:
+        assert client.get('/api/health').json()['provider'] == 'sample'
+        walk = analyze(client).json()
+        assert walk['events'] == []
+        assert walk['speech'] is None
+        read = analyze(client, 'read').json()
+        assert read['events'][0]['clarity'] == 'high'
+        assert read['speech']['text'].startswith('标牌文字：样例牌')
 
 
 def test_missing_configuration_never_falls_back_to_samples():
@@ -130,3 +206,18 @@ def test_busy_request_is_not_queued():
             assert response.json()['error_code'] == 'busy'
         finally:
             client.portal.call(client.app.state.lock.release)
+
+
+def test_repeat_speech_suppressed_within_window_but_events_still_returned():
+    content = {'events': [{'category': 'obstacle', 'label': 'stairs',
+                           'direction': 'front', 'text': None}]}
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, json={'choices': [{'message': {'content': json.dumps(content)}}]}))
+    with TestClient(create_app(Settings(api_key='test-only'), transport)) as client:
+        first = analyze(client, source='video', frame_id='1').json()
+        second = analyze(client, source='video', frame_id='2').json()
+        other = analyze(client, source='video', session_id='other-session', frame_id='3').json()
+    assert first['speech']['text'] == '前方发现楼梯'
+    assert second['speech'] is None
+    assert [e['label'] for e in second['events']] == ['stairs']
+    assert other['speech']['text'] == '前方发现楼梯'

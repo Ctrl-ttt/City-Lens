@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+﻿import { test, expect, type Page } from '@playwright/test';
 
 async function ready(page: Page) {
   await page.goto('/');
@@ -11,7 +11,9 @@ test('sample mode, fake camera, read mode and release work against the real loca
   page.on('pageerror', error => errors.push(error.message));
   await ready(page);
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
+  await expect(page.locator('.prediction-audit')).toBeVisible();
+  await expect(page.locator('.prediction-audit')).toContainText(/预测|延迟/);
   await page.getByRole('button', { name: '看牌 · 读取文字' }).click();
   await expect(page.locator('.live-caption')).toContainText('标牌文字：样例牌');
   await page.getByRole('button', { name: '停止并释放输入' }).click();
@@ -43,7 +45,7 @@ test('a delayed old response never appears after switching input', async ({ page
 test('consecutive failures clear old results and pause automatic analysis', async ({ page }) => {
   await ready(page);
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
   let failures = 0;
   await page.route('**/api/analyze', async route => {
     failures++;
@@ -56,10 +58,47 @@ test('consecutive failures clear old results and pause automatic analysis', asyn
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeVisible();
 });
 
+test('transient busy and rate-limited rounds skip without tripping the pause', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-01-01T12:00:00Z') });
+  await ready(page);
+  await page.getByRole('button', { name: '▶ 开始识别' }).click();
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
+  let calls = 0;
+  await page.route('**/api/analyze', async route => {
+    calls++;
+    if (calls <= 4)
+      await route.fulfill({ status: 429, json: { status: 'error', error_code: 'busy', message: '上一帧仍在识别，请稍后再试。' } });
+    else if (calls === 5)
+      await route.fulfill({ status: 200, json: { status: 'error', error_code: 'rate_limited', message: '模型请求过于频繁，请稍后恢复。' } });
+    else await route.fulfill({ response: await route.fetch() });
+  });
+  // Fake clock + strict single-flight: advance one tick at a time and let each
+  // round's real network trip settle before the next tick, otherwise pending
+  // tickets swallow every subsequent interval.
+  for (let i = 0; i < 5; i++) {
+    await page.clock.runFor(2000);
+    await expect.poll(() => calls).toBeGreaterThan(i);
+    await page.waitForTimeout(50);
+  }
+  // Four consecutive 429s would trip the three-failure pause; the walk loop must survive.
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
+  await expect(page.locator('.event-list')).not.toBeEmpty();
+  await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeHidden();
+  await expect(page.getByRole('alert')).toContainText('模型请求过于频繁');
+  // The cooldown parks the ticker until its window clears, then recognition resumes.
+  const parked = calls;
+  await page.clock.runFor(14000);
+  expect(calls).toBe(parked);
+  await page.clock.runFor(2000);
+  await expect.poll(() => calls).toBeGreaterThan(parked);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
+});
+
 test('pause aborts pending recognition and stops sampling', async ({ page }) => {
   await ready(page);
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
   await page.getByRole('button', { name: 'Ⅱ 暂停识别' }).click();
   let count = 0;
   page.on('request', request => { if (request.url().endsWith('/api/analyze')) count++; });
@@ -94,13 +133,13 @@ test('video uploads frames, invalidates seeking, and restarts after ending', asy
   const response = page.waitForResponse('**/api/analyze');
   await page.getByRole('button', { name: '识别当前环境', exact: true }).click();
   expect((await response).status()).toBe(200);
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
   await page.locator('video').evaluate(v => { (v as HTMLVideoElement).currentTime = .5; });
   await expect(page.locator('.live-caption')).toContainText('视频位置已改变');
   await page.locator('video').evaluate(async v => { const video = v as HTMLVideoElement; video.currentTime = video.duration - .2; await video.play(); });
   await expect(page.locator('.live-caption')).toHaveText('视频已结束');
   await page.getByRole('button', { name: '识别当前环境', exact: true }).click();
-  await expect(page.locator('.live-caption')).toHaveText('右前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('右侧发现楼梯');
 });
 
 test('mobile layout does not overflow and consent gates recognition', async ({ page }) => {

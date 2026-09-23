@@ -1,4 +1,4 @@
-import { defineConfig } from '@playwright/test';
+﻿import { defineConfig } from '@playwright/test';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ export default defineConfig({
     channel: browserChannel,
     headless: true,
     viewport: { width: 1440, height: 1050 },
-    launchOptions: { args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] },
+    launchOptions: { args: ['--disable-gpu', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] },
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
   },
@@ -30,7 +30,7 @@ export default defineConfig({
     command: `"${python}" -m uvicorn backend.app:app --host 127.0.0.1 --port 8000`,
     cwd: root,
     url: 'http://localhost:8000/api/health',
-    env: { CITYLENS_PROVIDER: 'sample', CITYLENS_SAMPLE_SCENE: 'bicycle' },
+    env: { CITYLENS_PROVIDER: 'sample', CITYLENS_SAMPLE_SCENE: 'stairs' },
     reuseExistingServer: false,
     timeout: 30000,
   },
