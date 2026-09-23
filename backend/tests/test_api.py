@@ -39,17 +39,17 @@ def test_sample_contract_and_health():
         assert analyze(client, 'read').json()['speech'] is not None
 
 
-@pytest.mark.parametrize('scene,mode,status,speech', [
-    ('empty', 'walk', 'ok', None),
-    ('unclear', 'walk', 'uncertain', None),
-    ('empty', 'read', 'ok', '标牌文字：样例牌：城市图书馆'),
-    ('unclear', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
+@pytest.mark.parametrize('scene,mode,status,event_count,speech', [
+    ('empty', 'walk', 'ok', 0, None),
+    ('unclear', 'walk', 'uncertain', 0, None),
+    ('empty', 'read', 'ok', 1, '标牌文字：样例牌：城市图书馆'),
+    ('unclear', 'read', 'uncertain', 0, '文字看不清，请调整拍摄角度'),
 ])
-def test_empty_and_unclear(scene, mode, status, speech):
+def test_empty_and_unclear(scene, mode, status, event_count, speech):
     with TestClient(create_app(Settings(provider='sample', sample_scene=scene))) as client:
         result = analyze(client, mode).json()
         assert result['status'] == status
-        assert result['events'] == []
+        assert len(result['events']) == event_count
         assert (result['speech']['text'] if result['speech'] else None) == speech
 
 
