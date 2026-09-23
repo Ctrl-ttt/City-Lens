@@ -2,7 +2,8 @@ import json
 
 import pytest
 from backend.models import AnalyzeInput, SpatialObservation, VisionResult
-from backend.rules import summarize
+from backend.rules import score, summarize
+from backend.spatial import calculate_approach_speed
 from backend.vision import parse_result, VisionError
 
 
@@ -14,7 +15,7 @@ def sign(text='中山路', clarity='high', direction='front'):
     return dict(category='text', label='sign', direction=direction, text=text, clarity=clarity)
 
 
-def obstacle(label='bicycle', direction='front', proximity='unknown', confidence=None, approaching=False):
+def obstacle(label='car', direction='front', proximity='unknown', confidence=None, approaching=False):
     return SpatialObservation(category='obstacle', label=label, direction=direction,
                               proximity=proximity, approaching=approaching, confidence=confidence)
 
@@ -28,15 +29,40 @@ def summary(events, mode='walk', uncertain=False, min_confidence=0.0, continuous
 def spatial_summary(events, mode='walk', min_confidence=0.0):
     return summarize(AnalyzeInput(mode=mode, source='video', session_id='s', frame_id=3),
                      VisionResult.model_validate({'events': events}), spatial=events,
-                     min_confidence=min_confidence)
+                     min_confidence=min_confidence, score_threshold=70, detail_level='medium')
 
 
 def test_walk_excludes_signs_and_keeps_priority_dedup_limit():
-    response = summary([sign(), event('bus_stop', 'facility'), event('bicycle'),
+    response = summary([sign(), event('bus_stop', 'facility'), event('car'),
                         event('stairs'), event('stairs'), event('barrier')])
-    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'barrier', 'bus_stop']
-    assert response.speech.text == '前方发现楼梯；前方发现自行车'
+    assert [e.label for e in response.events] == ['stairs', 'car', 'barrier', 'bus_stop']
+    assert response.speech.text == '前方发现楼梯；前方发现车辆'
     assert response.speech.priority == 'high'
+
+
+def test_new_score_threshold_and_detail_profiles():
+    events = [SpatialObservation(**event('stairs'), proximity='near'),
+              SpatialObservation(**event('car', direction='right'), proximity='near'),
+              SpatialObservation(**event('barrier', direction='left'), proximity='near')]
+    assert score(events[0]) == score(SpatialObservation(**event('escalator', 'facility'))) + 32
+    assert summarize(AnalyzeInput(mode='walk', source='video', session_id='s', frame_id=1), VisionResult(), spatial=events,
+                     score_threshold=130, detail_level='low').speech is None
+    for level, count in [('low', 3), ('medium', 2), ('high', 1)]:
+        response = summarize(AnalyzeInput(mode='walk', source='video', session_id='s', frame_id=1), VisionResult(),
+                             spatial=events, score_threshold=0, detail_level=level)
+        assert len(response.speech.key.split('|')) == count
+
+
+@pytest.mark.parametrize('samples, level', [
+    ([(0, 100), (1, 104), (2, 108)], 'slow'),
+    ([(0, 100), (1, 120), (2, 145)], 'medium'),
+    ([(0, 100), (1, 180), (2, 330)], 'fast'),
+    ([(0, 100), (1, 90), (2, 80)], 'unknown'),
+])
+def test_calculate_approach_speed_levels(samples, level):
+    rate, actual = calculate_approach_speed(samples)
+    assert actual == level
+    assert rate is None or rate >= 0
 
 
 def test_box_is_kept_as_normalized_ints():
@@ -59,7 +85,7 @@ def test_escalator_is_a_facility_and_keeps_model_category():
         parse_result(json.dumps({'events': [event('escalator')]}))
     response = summary([event('escalator', 'facility')])
     assert response.speech.text == '前方发现自动扶梯'
-    assert response.speech.priority == 'low'
+    assert response.speech.priority == 'high'
 
 
 def test_walk_drops_signs_and_keeps_facility_priority():
@@ -71,16 +97,16 @@ def test_walk_drops_signs_and_keeps_facility_priority():
 
 def test_danger_tiers_order_steps_obstacles_then_facilities():
     response = summary([sign(), event('escalator', 'facility'),
-                        event('bicycle'), event('stairs')])
-    assert [e.label for e in response.events] == ['stairs', 'bicycle', 'escalator']
-    assert response.speech.text == '前方发现楼梯；前方发现自行车'
+                        event('car'), event('stairs')])
+    assert [e.label for e in response.events] == ['stairs', 'escalator', 'car']
+    assert response.speech.text == '前方发现楼梯；前方发现车辆'
 
 
 def test_collision_tier_orders_front_before_sides():
     response = summary([event('barrier', direction='right'),
-                        event('bollard', direction='left'), event('bicycle')])
+                        event('bollard', direction='left'), event('car')])
     assert [(e.label, e.direction) for e in response.events] == [
-        ('bicycle', 'front'), ('barrier', 'right'), ('bollard', 'left')]
+        ('car', 'front'), ('barrier', 'right'), ('bollard', 'left')]
 
 
 @pytest.mark.parametrize('mode', ['walk', 'read'])
@@ -111,7 +137,7 @@ def test_sign_dedup_ignores_direction_and_clarity_and_normalizes_whitespace():
 
 
 def test_obstacle_dedup_still_distinguishes_direction():
-    response = summary([event('bicycle', direction='left'), event('bicycle', direction='right')])
+    response = summary([event('car', direction='left'), event('car', direction='right')])
     assert [e.direction for e in response.events] == ['left', 'right']
 
 
@@ -187,10 +213,15 @@ def test_sign_with_null_text_is_rejected():
         parse_result(json.dumps({'events': [{**sign(), 'text': None}]}))
 
 
-@pytest.mark.parametrize('raw', ['```', '```json```', 'null', '[]', '{"events":[],"advice":"go"}', '{"events":[{"category":"facility","label":"bicycle","direction":"front"}]}'])
+@pytest.mark.parametrize('raw', ['```', '```json```', 'null', '[]', '{"events":[],"advice":"go"}', '{"events":[{"category":"facility","label":"car","direction":"front"}]}'])
 def test_malformed_outputs_rejected(raw):
     with pytest.raises(VisionError, match='invalid_model_output'):
         parse_result(raw)
+
+
+def test_bicycle_from_an_older_model_is_silently_dropped():
+    result = parse_result('{"events":[{"label":"bicycle","direction":"front","box":[10,20,200,500]}]}')
+    assert result.events == []
 
 
 def test_fenced_json_accepted():
@@ -222,8 +253,8 @@ def test_repeat_speech_suppressed_within_window_and_recovers_at_boundary():
 def test_repeat_suppression_tracks_speech_key_not_frame():
     recent = {}
     assert repeat_summary([event('stairs')], recent, now=0.0).speech is not None
-    different = repeat_summary([event('bicycle')], recent, now=1.0)
-    assert different.speech.text == '前方发现自行车'
+    different = repeat_summary([event('car')], recent, now=1.0)
+    assert different.speech.text == '前方发现车辆'
 
 
 def test_repeat_suppression_is_per_session_dict():
@@ -248,11 +279,11 @@ def test_read_unclear_speech_is_deduped_within_window():
 
 
 def test_far_obstacle_is_not_spoken_but_kept_in_details():
-    response = spatial_summary([obstacle('bicycle', proximity='far'),
+    response = spatial_summary([obstacle('car', proximity='far'),
                                 obstacle('bollard', proximity='near')])
-    assert [e.label for e in response.events] == ['bollard', 'bicycle']
+    assert [e.label for e in response.events] == ['bollard', 'car']
     assert response.speech.key == 'bollard:front:near'
-    assert response.speech.text == '前方发现路障'
+    assert response.speech.text == '前方发现路障，较近'
 
 
 def test_far_person_with_unknown_confidence_is_also_silent():

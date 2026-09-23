@@ -21,7 +21,7 @@ def meta(frame=1, **kw):
                         projection='equirectangular', **kw)
 
 
-def event(label='bicycle', view='front', box=None, **kw):
+def event(label='car', view='front', box=None, **kw):
     return Observation(category='obstacle', label=label, direction='front', view=view,
                        box=box if box is not None else [400, 300, 600, 700], **kw)
 
@@ -67,7 +67,7 @@ def test_large_overhead_box_does_not_imply_close_head_clearance():
 
 def test_background_roof_is_visible_but_not_spoken_as_a_hazard():
     roof=Observation(category='facility',label='canopy',direction='above')
-    result=summarize(meta(),VisionResult(events=[roof]))
+    result=summarize(meta(),VisionResult(events=[roof]), score_threshold=70, detail_level='medium')
     assert result.events[0].label=='canopy'
     assert result.speech is None
 
@@ -76,6 +76,16 @@ def test_camera_carrier_head_fragment_does_not_monopolize_front_alerts():
     tracker=SpatialSessions()
     events,_=tracker.process(meta(),VisionResult(events=[event('person','front',[200,800,650,1000]),event('stairs','front')]),960,480,Settings(),0)
     assert [e.label for e in events]==['stairs']
+
+
+def test_down_face_person_is_treated_as_the_camera_carrier_but_side_people_remain():
+    tracker = SpatialSessions()
+    events, _ = tracker.process(meta(), VisionResult(events=[
+        event('person', 'down', [100, 100, 900, 900]),
+        event('person', 'left', [350, 250, 650, 900]),
+    ]), 960, 480, Settings(), 0)
+    assert len(events) == 1
+    assert events[0].label == 'person' and events[0].view == 'left'
 
 
 def test_clipped_person_height_is_not_used_as_a_full_body_distance():
@@ -171,7 +181,7 @@ def test_width_fallback_does_not_treat_height_crop_changes_as_motion():
 
 def test_adjacent_face_duplicates_are_merged_across_angular_boundary():
     tracker=SpatialSessions()
-    observations=[event('bicycle','front',[950,300,1000,700]),event('bicycle','right',[0,300,50,700])]
+    observations=[event('car','front',[950,300,1000,700]),event('car','right',[0,300,50,700])]
     events,_=tracker.process(meta(),VisionResult(events=observations),960,480,Settings(),0)
     assert len(events)==1
 
@@ -192,10 +202,10 @@ def test_atlas_global_box_determines_direction_without_model_view_guess():
 
 def test_unlocalizable_roof_and_missing_box_do_not_hide_grounded_obstacle():
     result=parse_result(json.dumps({'events':[
-        {'label':'bicycle','box':[100,100,200,300]},
+        {'label':'car','box':[100,100,200,300]},
         {'label':'canopy','box':[0,0,999,650]},
         {'label':'sign','text':'测试牌','clarity':'high'}]}),panorama=True)
-    assert [e.label for e in result.events]==['bicycle']
+    assert [e.label for e in result.events]==['car']
     assert not result.uncertain
     only_missing=parse_result('{"events":[{"label":"person"}]}',panorama=True)
     assert only_missing.uncertain and only_missing.events==[]
@@ -234,6 +244,18 @@ def test_rear_tracking_tolerates_actual_cloud_sampling_interval():
     assert rear_sequence([300,380,480], times=[0,6.1,12.2])[-1].approaching
 
 
+def test_front_approach_needs_three_consistent_near_observations():
+    tracker = SpatialSessions(); observations = []
+    for i, height in enumerate([300, 380, 480]):
+        current, _ = tracker.process(meta(i + 1), VisionResult(events=[event('car', 'front', [400, 500-height//2, 600, 500+height//2])]),
+                                     960, 480, Settings(), i * 2)
+        observations.append(current[0])
+    assert [item.approaching for item in observations] == [False, False, True]
+    response = summarize(meta(), VisionResult(), spatial=[observations[-1]])
+    assert response.speech.priority == 'urgent'
+    assert response.speech.text.startswith('前方车辆疑似正在靠近')
+
+
 @pytest.mark.parametrize('heights', [[450,450,450], [450,400,350], [100,130,160], [300,700,480]])
 def test_rear_stationary_receding_distant_and_jumpy_boxes_do_not_trigger(heights):
     assert not any(e.approaching for e in rear_sequence(heights))
@@ -254,10 +276,10 @@ def test_multiple_similar_people_cannot_be_combined_into_one_approach():
 
 def test_front_priority_side_coverage_and_two_target_budget():
     observations = [SpatialObservation(**event(label,view).model_dump(), proximity='mid') for label,view in
-                    [('bicycle','front'),('bollard','front'),('barrier','left'),('person','back')]]
+                    [('car','front'),('bollard','front'),('barrier','left'),('person','back')]]
     for e in observations: e.direction = e.view
     response = summarize(meta(),VisionResult(),spatial=observations)
-    assert response.speech.text == '前方发现自行车；左侧发现围挡'
+    assert response.speech.text == '前方发现车辆；左侧发现围挡'
     assert len(response.speech.key.split('|')) == 2
 
 
@@ -265,11 +287,11 @@ def test_same_direction_people_with_different_ranges_do_not_repeat_identical_phr
     near=SpatialObservation(**event('person','back').model_dump(),proximity='near')
     mid=SpatialObservation(**event('person','back').model_dump(),proximity='mid')
     near.direction=mid.direction='back'
-    side=SpatialObservation(**event('bicycle','left').model_dump());side.direction='left'
+    side=SpatialObservation(**event('car','left').model_dump());side.direction='left'
     recent={}
     first=summarize(meta(),VisionResult(),recent,now=0,repeat_seconds=8,spatial=[near,mid,side])
     assert first.speech.text.count('后方发现行人')==1
-    assert '左侧发现自行车' in first.speech.text
+    assert '左侧发现车辆' in first.speech.text
     assert summarize(meta(2),VisionResult(),recent,now=2,repeat_seconds=8,spatial=[mid]).speech is None
 
 
@@ -283,7 +305,7 @@ def test_near_side_vehicle_outranks_distant_front_vehicle_and_overhead_gets_slot
 
 def test_repeated_first_target_falls_through_to_other_targets():
     recent={}
-    observations=[event('stairs'),event('bicycle'),event('barrier','left')]
+    observations=[event('stairs'),event('car'),event('barrier','left')]
     result=VisionResult(events=observations)
     first=summarize(meta(),result,recent,now=0,repeat_seconds=8)
     second=summarize(meta(2),result,recent,now=2,repeat_seconds=8)
@@ -306,7 +328,7 @@ def test_http_panorama_uses_one_request_with_atlas_and_maps_model_view():
     requests=[]
     def handler(request):
         requests.append(json.loads(request.content))
-        result={'uncertain':False,'events':[{'label':'bicycle','box':[100,650,200,900]}]}
+        result={'uncertain':False,'events':[{'label':'car','box':[100,650,200,900]}]}
         return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(result)}}]})
     with TestClient(create_app(Settings(api_key='test'),httpx.MockTransport(handler))) as client:
         fields={k:str(v) for k,v in meta().model_dump().items()}

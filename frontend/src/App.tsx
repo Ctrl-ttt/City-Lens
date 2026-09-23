@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Accessibility, ALargeSmall, Camera, Contrast, FileVideo, Headphones, Info, Pause, Play, RotateCcw, ScanText, Square, Volume2, VolumeX } from 'lucide-react';
-import type { Analysis, Channel, Health, Mode, Projection, RealtimeState, Source } from './types';
+import type { Analysis, Channel, Health, Mode, Projection, RealtimeState, Source, SpeechDetailLevel } from './types';
 import { SessionGate, HttpError } from './session';
+import { FramePacer, waitForVideoFrame } from './capture';
+import { directionFromBox, estimateLocalProximity, FrameHistory, rewriteSpeechForMotion, snapshotVideo, trackTrajectory, type GrayFrame } from './motion';
 import { SpeechQueue, browserVoiceDriver, chineseVoice, type Candidate } from './speech';
 import { captureRealtimeFrame, RealtimeClient } from './realtime';
 import cityLensMark from './assets/citylens-mark.svg';
@@ -10,6 +12,14 @@ import './brand.css';
 
 const sourceNames = { camera: '实时摄像头', video: '路线视频回放' };
 const directionNames = { left: '左侧', front: '前方', right: '右侧', back: '后方', above: '上方', unknown: '画面中' };
+type PredictionAudit = {
+  state: 'unused' | 'kept' | 'blocked' | 'observed';
+  title: string;
+  detail: string;
+  ageMs: number;
+  matched: number;
+  attempted: number;
+};
 
 export default function App() {
   const video = useRef<HTMLVideoElement>(null);
@@ -36,6 +46,14 @@ export default function App() {
   const readingRef = useRef(false);
   const internalRead = useRef(false);
   const cooldownUntil = useRef(0);
+  const httpPacer = useRef(new FramePacer());
+  // HTTP remains single-flight, but a slow model must not make the next timer
+  // tick disappear.  Keep only the fact that a newer frame is wanted; the
+  // frame is captured after the current request completes, so it is genuinely
+  // the newest decoded video frame rather than an old JPEG waiting in a queue.
+  const pendingHttpMode = useRef<Mode | null>(null);
+  const motionFrames = useRef(new Map<string, GrayFrame>());
+  const frameHistory = useRef(new FrameHistory());
   const scratch = useRef<HTMLCanvasElement | null>(null);
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -56,9 +74,12 @@ export default function App() {
   const [result, setResult] = useState<Analysis | null>(null);
   const [history, setHistory] = useState<Analysis[]>([]);
   const [roundtrip, setRoundtrip] = useState(0);
+  const [predictionAudit, setPredictionAudit] = useState<PredictionAudit | null>(null);
   const [singleOnly, setSingleOnly] = useState(false);
   const [largeText, setLargeText] = useState(false);
   const [highContrast, setHighContrast] = useState(false);
+  const [speechThreshold, setSpeechThreshold] = useState(70);
+  const [speechDetail, setSpeechDetail] = useState<SpeechDetailLevel>('medium');
 
   if (!queue.current) queue.current = new SpeechQueue(browserVoiceDriver(() => setVoiceError('语音播放失败，请检查系统中文语音和输出设备。')), () => gate.current.session);
 
@@ -75,6 +96,8 @@ export default function App() {
         channelRef.current = next; setChannel(next); setConnectionState('waiting');
       }
       healthRef.current = value; setHealth(value); setHealthError('');
+      if (value.speech_score_threshold !== undefined) setSpeechThreshold(value.speech_score_threshold);
+      if (value.speech_detail_level) setSpeechDetail(value.speech_detail_level);
     } catch { if (mounted.current) { invalidate(); setHealth(null); setHealthError('后端未连接，请运行启动脚本后重新检查。'); } }
   }
 
@@ -86,9 +109,13 @@ export default function App() {
   }
   function clearResults() {
     queue.current?.clear(); last.current = null;
-    setResult(null); setHistory([]); setRoundtrip(0);
+    motionFrames.current.clear();
+    frameHistory.current.clear();
+    setResult(null); setHistory([]); setRoundtrip(0); setPredictionAudit(null);
   }
   function invalidate(message?: string) {
+    httpPacer.current.reset();
+    pendingHttpMode.current = null;
     active.current = false; setRunning(false); setBusy(false); setConnecting(false);
     closeRealtime(); gate.current.reset(); clearResults();
     if (message) setNotice(message);
@@ -126,7 +153,7 @@ export default function App() {
     if (sourceRef.current === 'video') video.current?.pause();
   }
   function failure(message: string) {
-    queue.current?.clear(); last.current = null; setResult(null); setRoundtrip(0);
+    queue.current?.clear(); last.current = null; setResult(null); setRoundtrip(0); setPredictionAudit(null);
     setNotice('本次识别不可用，请重新观察当前画面');
     if (gate.current.failed()) { invalidate('已暂停自动识别'); setError(`${message} 连续三次失败，请检查后重新开始。`); }
     else setError(message);
@@ -139,9 +166,24 @@ export default function App() {
     // Poll readiness between send slots so encoding time cannot skip a whole second.
     // A read turn parks this timer so an HTTP read cannot race the realtime lock.
     // The rate-limit cooldown pauses walk rounds until the provider window clears.
-    const timer = setInterval(() => { if (active.current && !readingRef.current && Date.now() >= cooldownUntil.current) void analyzeRef.current('walk'); }, channel === 'realtime' ? 100 : 2000);
+    const timer = setInterval(() => {
+      if (active.current && !readingRef.current && Date.now() >= cooldownUntil.current
+          && (channelRef.current === 'realtime' || httpPacer.current.ready(Date.now()))) void analyzeRef.current('walk');
+    }, 100);
     return () => clearInterval(timer);
   }, [channel]);
+
+  useEffect(() => {
+    if ((!running && !busy) || !ready || projection !== 'rectilinear') return;
+    const sample = () => {
+      const element = video.current;
+      if (!element || element.readyState < 2 || document.hidden) return;
+      frameHistory.current.add(Date.now(), snapshotVideo(element, sourceRef.current === 'camera'));
+    };
+    sample();
+    const timer = setInterval(sample, 400);
+    return () => clearInterval(timer);
+  }, [running, busy, ready, projection, source]);
 
   useEffect(() => {
     mounted.current = true;
@@ -309,12 +351,83 @@ export default function App() {
     }
   }
 
-  function publishResult(data: Analysis, capturedAt: number, manual: boolean) {
+  function motionKey(session: string, frame: number) { return `${session}:${frame}`; }
+  function rememberMotionFrame(session: string, frame: number, image: GrayFrame | null) {
+    if (!image) return;
+    const frames = motionFrames.current;
+    frames.set(motionKey(session, frame), image);
+    while (frames.size > 20) frames.delete(frames.keys().next().value!);
+  }
+  function compensateStaleResult(data: Analysis, capturedAt: number, manual: boolean): { data: Analysis; audit: PredictionAudit } {
+    const key = motionKey(data.session_id, data.frame_id);
+    const reference = motionFrames.current.get(key);
+    const ageMs = Math.max(0, Date.now() - capturedAt);
+    const base = (state: PredictionAudit['state'], title: string, detail: string, matched = 0, attempted = 0) =>
+      ({ state, title, detail, ageMs, matched, attempted });
+    // Results from dropped realtime frames cannot accumulate local image history.
+    for (const entry of motionFrames.current.keys()) if (entry.startsWith(`${data.session_id}:`)) {
+      const frame = Number(entry.slice(data.session_id.length + 1));
+      if (frame <= data.frame_id) motionFrames.current.delete(entry);
+    }
+    if (manual) return { data, audit: base('unused', '预测未参与播报', '手动看牌使用原始画面结果。') };
+    if (projection !== 'rectilinear') return { data, audit: base('unused', '预测未参与播报', '全景模式使用服务端方向判断。') };
+    if (ageMs < 120) return { data, audit: base('unused', '无需延迟补偿', '结果返回很快，直接使用原始播报。') };
+    const spokenPrefixes = new Set((data.speech?.key ?? '').split('|').map(key => key.replace(/:(?:approaching|near)$/, '')));
+    if (!reference) return { data, audit: base('unused', '预测不可用', '没有找到发送时的本地参考帧，结果未做位置校正。') };
+    const current = video.current && snapshotVideo(video.current, sourceRef.current === 'camera');
+    if (!current) return { data, audit: base('unused', '预测不可用', '当前视频帧无法读取，结果未做位置校正。') };
+    const now = Date.now();
+    const frames = frameHistory.current.after(capturedAt, now);
+    if (!frames.length || now - frames.at(-1)!.at > 100) frames.push({ at: now, image: current });
+    else frames[frames.length - 1] = { at: now, image: current };
+    let allSpokenObstaclesTracked = true, allSpokenObstaclesRelevant = true;
+    let matched = 0, attempted = 0, directionChanges = 0, longestTrack = 0;
+    const events = data.events.map(event => {
+      if (!event.box) return event;
+      attempted++;
+      const spoken = spokenPrefixes.has(`${event.label}:${event.direction}`);
+      const trajectory = trackTrajectory(reference, event.box, capturedAt, frames, 2.5);
+      if (!trajectory) {
+        if (spoken && event.category === 'obstacle') allSpokenObstaclesTracked = false;
+        return event;
+      }
+      matched++;
+      longestTrack = Math.max(longestTrack, trajectory.samples);
+      const direction = event.direction === 'above' ? 'above' : directionFromBox(trajectory.predictedBox, event.direction);
+      if (direction !== event.direction) directionChanges++;
+      const proximity = estimateLocalProximity(event.label, trajectory.box, current.width / current.height, healthRef.current?.camera_hfov_deg ?? 75);
+      if (spoken && event.category === 'obstacle' && proximity === 'far') allSpokenObstaclesRelevant = false;
+      const locallyApproaching = trajectory.approaching && proximity === 'near' && ['person','car','motorcycle'].includes(event.label);
+      return { ...event, original_direction: event.direction, direction, original_box: event.box, box: trajectory.box,
+        predicted_box: trajectory.predictedBox, proximity, approaching: event.approaching || locallyApproaching, motion_compensated: true,
+        direction_predicted: direction !== event.direction, motion_samples: trajectory.samples,
+        forecast_seconds: trajectory.forecastSeconds, approach_rate: trajectory.approachRate, speed_level: trajectory.speedLevel };
+    });
+    // A late obstacle warning is withheld if its labelled region has disappeared
+    // or cannot be uniquely located in the newest frame.  Text-only reads remain
+    // governed by their separate manual freshness budget.
+    const lateObstacleSpeech = !!data.speech && data.events.some(event => event.category === 'obstacle' && !!event.box
+      && spokenPrefixes.has(`${event.label}:${event.direction}`));
+    const blocked = lateObstacleSpeech && (!allSpokenObstaclesTracked || !allSpokenObstaclesRelevant);
+    let speech = blocked ? null : data.speech;
+    if (speech) speech = rewriteSpeechForMotion(speech, events, directionNames);
+    const adjusted = { ...data, events, speech };
+    const title = blocked ? '预测已取消旧播报' : matched ? (data.speech ? '预测后保留播报' : '预测已校正目标') : '预测未找到可靠位移';
+    const detail = blocked ? (!allSpokenObstaclesTracked ? '播报目标未能在连续画面中可靠匹配，因此没有播放旧提示。' : '本地粗略距离显示目标已经处于较远区域，因此取消旧提示。')
+      : matched ? `已用最多 ${longestTrack} 个本地帧将 ${matched} 个目标更新到当前画面${directionChanges ? `，并更新了 ${directionChanges} 个方向。` : '。'}${data.speech ? ' 播报内容保持有效。' : ''}`
+      : '目标纹理不足、画面变化过大或匹配不唯一，未修改位置。';
+    return { data: adjusted, audit: base(blocked ? 'blocked' : matched && data.speech ? 'kept' : 'observed', title, detail, matched, attempted) };
+  }
+
+  function publishResult(raw: Analysis, capturedAt: number, manual: boolean) {
+    const compensated = compensateStaleResult(raw, capturedAt, manual);
+    const data = compensated.data;
     if (data.session_id !== gate.current.session) return;
-    // Panorama rounds run 5-7 s by nature, so their freshness budget spans the abort window.
-    const maxAge = manual ? 8000 : projection === 'equirectangular' ? 9000 : 6000;
-    if (Date.now() - capturedAt > maxAge) { failure('结果已过期，本次内容未播报。可切换按键识别。'); return; }
-    gate.current.succeeded(); setError(''); setResult(data); setRoundtrip(Date.now() - capturedAt);
+    // Do not reject a model response based on elapsed time. Slow inference is
+    // expected; show its result and let the motion-compensation audit explain
+    // whether a local track was available.
+    const maxAge = Number.POSITIVE_INFINITY;
+    gate.current.succeeded(); setError(''); setResult(data); setRoundtrip(Date.now() - capturedAt); setPredictionAudit(compensated.audit);
     setHistory(items => [data, ...items].slice(0, 5));
     setNotice(data.speech?.text ?? (data.status === 'uncertain' ? '画面不清晰，请调整拍摄角度' : '本帧没有可确认的提示；不代表通行安全'));
     if (data.speech) {
@@ -336,7 +449,13 @@ export default function App() {
       if (!client?.canSend) return;
       const capturedAt = Date.now();
       try {
-        if (client.send({ type: 'frame', session_id: gate.current.session, frame_id: ++gate.current.frame, mode: 'walk', source: sourceRef.current, image: captureRealtimeFrame(element, sourceRef.current === 'camera') }, capturedAt)) setBusy(true);
+        const frame = ++gate.current.frame;
+        const reference = snapshotVideo(element, sourceRef.current === 'camera');
+        if (client.send({ type: 'frame', session_id: gate.current.session, frame_id: frame, mode: 'walk', source: sourceRef.current, image: captureRealtimeFrame(element, sourceRef.current === 'camera'), speech_threshold: speechThreshold, speech_detail_level: speechDetail }, capturedAt)) {
+          rememberMotionFrame(gate.current.session, frame, reference);
+          frameHistory.current.add(capturedAt, reference);
+          setBusy(true);
+        }
       } catch (reason) {
         if (realtime.current !== client) return;
         closeRealtime(); active.current = false; setRunning(false); setBusy(false);
@@ -344,23 +463,24 @@ export default function App() {
       }
       return;
     }
-    // HTTP (including manual reading) remains strictly single-flight.
+    // HTTP (including manual reading) remains strictly single-flight.  During a
+    // slow request retain one latest-frame request instead of silently dropping
+    // every timer tick.  The actual capture happens in the finally continuation
+    // below, immediately after the in-flight request is released.
+    if (gate.current.pending && requestedMode === 'walk' && active.current && !readingRef.current) {
+      pendingHttpMode.current = requestedMode;
+      return;
+    }
     const ticket = gate.current.acquire(Date.now());
     if (!ticket) return;
+    httpPacer.current.started(Date.now());
     setBusy(true);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const canvas = scratch.current ??= document.createElement('canvas');
       if (projection === 'equirectangular' && Math.abs(element.videoWidth / element.videoHeight - 2) > 0.04) throw new Error('请选择已拼接的 2:1 全景 MP4；双鱼眼原片不能直接识别。');
-      // Draw right after a presented frame so capture never contends with compositing.
-      if (!element.paused && 'requestVideoFrameCallback' in element) {
-        await new Promise<void>(resolve => {
-          const settle = () => resolve();
-          setTimeout(settle, 250);
-          element.requestVideoFrameCallback(settle);
-        });
-        if (!gate.current.current(ticket)) return;
-      }
+      await waitForVideoFrame(element, ticket.controller.signal);
+      if (!gate.current.current(ticket)) return;
       const scale = Math.min(1, (projection === 'equirectangular' ? 1920 : requestedMode === 'read' ? 1280 : 960) / Math.max(element.videoWidth, element.videoHeight));
       const width = Math.round(element.videoWidth * scale), height = Math.round(element.videoHeight * scale);
       if (canvas.width !== width) canvas.width = width;
@@ -368,7 +488,11 @@ export default function App() {
       const context = canvas.getContext('2d')!;
       const flip = sourceRef.current === 'camera' && projection === 'rectilinear';
       context.setTransform(flip ? -1 : 1, 0, 0, 1, flip ? canvas.width : 0, 0);
+      ticket.capturedAt = Date.now();
       context.drawImage(element, 0, 0, canvas.width, canvas.height);
+      const reference = snapshotVideo(element, flip);
+      rememberMotionFrame(ticket.session, ticket.frame, reference);
+      frameHistory.current.add(ticket.capturedAt, reference);
       const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.75));
       if (!gate.current.current(ticket)) return;
       if (!blob) throw new Error('无法读取当前画面，请重新选择输入。');
@@ -376,6 +500,7 @@ export default function App() {
       form.append('image', blob, 'frame.jpg'); form.append('mode', requestedMode); form.append('source', sourceRef.current);
       form.append('session_id', ticket.session); form.append('frame_id', String(ticket.frame));
       form.append('projection', projection); form.append('heading_deg', String(heading));
+      form.append('speech_threshold', String(speechThreshold)); form.append('speech_detail_level', speechDetail);
       timer = setTimeout(() => ticket.controller.abort(), 9000);
       const response = await fetch('/api/analyze', { method: 'POST', body: form, signal: ticket.controller.signal });
       const data: Analysis = await response.json();
@@ -391,6 +516,7 @@ export default function App() {
         : reason instanceof TypeError ? new HttpError('network_error', '无法连接识别服务，请检查网络。')
         : reason instanceof Error ? reason : new Error('识别失败，请重试。');
       if (error instanceof HttpError && error.transient) {
+        httpPacer.current.defer(Date.now(), error.code === 'busy' ? 1000 : 1000);
         // Congestion and rate limits self-heal; keep the last result and keep trying.
         if (error.code === 'rate_limited') { cooldownUntil.current = Date.now() + 15000; setError('模型请求过于频繁，已自动放慢节奏，稍后恢复。'); }
         else if (error.code !== 'busy') setError(error.message);
@@ -401,6 +527,12 @@ export default function App() {
       if (timer) clearTimeout(timer);
       gate.current.finish(ticket);
       if (gate.current.current(ticket)) setBusy(false);
+      const nextMode = pendingHttpMode.current;
+      pendingHttpMode.current = null;
+      if (nextMode && gate.current.current(ticket) && active.current && !readingRef.current
+          && channelRef.current === 'http' && !document.hidden) {
+        void analyze(nextMode);
+      }
     }
   }
 
@@ -457,9 +589,10 @@ export default function App() {
       <section className="control-card" id="controls" aria-labelledby="control-title">
         <div className="control-top"><div><p className="section-index">操作</p><h2 id="control-title">开始了解周围环境</h2></div><label className="switch-label"><input type="checkbox" checked={singleOnly} onChange={e => { invalidate('识别方式已切换'); setSingleOnly(e.target.checked); }}/><span>只用按键识别</span></label></div>
         <fieldset className="source-field"><legend>输入来源</legend><div className="source-tabs"><button aria-pressed={source==='camera'} onClick={() => changeSource('camera')}><Camera aria-hidden="true"/>实时摄像头</button><button aria-pressed={source==='video'} onClick={() => changeSource('video')}><FileVideo aria-hidden="true"/>路线视频回放</button></div></fieldset>
-        {health && health.provider !== 'sample' && <fieldset className="channel-field"><legend>识别通道</legend><div className="source-tabs"><button aria-pressed={channel==='realtime'} disabled={!realtimeConfigured || projection === 'equirectangular'} onClick={() => changeChannel('realtime')}>实时连接</button><button aria-pressed={channel==='http'} disabled={!httpConfigured} onClick={() => changeChannel('http')}>HTTP 抽帧</button></div><p className="quiet-note">{channel === 'realtime' ? '浏览器以 1 fps 连续送帧；发送不等待分析。云端仍串行处理，忙时后端只保留最新待分析帧，结果可跳帧；不是云端双工或安全导航。' : 'HTTP 通道每两秒尝试抽帧。'} 未使用麦克风；手动看牌始终使用 HTTP。</p>{channel === 'realtime' && <p className="connection-state" role="status" aria-label="实时连接状态">实时连接：{connectionNames[connectionState]}</p>}</fieldset>}
+        {health && health.provider !== 'sample' && <fieldset className="channel-field"><legend>识别通道</legend><div className="source-tabs"><button aria-pressed={channel==='realtime'} disabled={!realtimeConfigured || projection === 'equirectangular'} onClick={() => changeChannel('realtime')}>实时连接</button><button aria-pressed={channel==='http'} disabled={!httpConfigured} onClick={() => changeChannel('http')}>HTTP 抽帧</button></div><p className="quiet-note">{channel === 'realtime' ? '浏览器以 1 fps 连续送帧；发送不等待分析。云端仍串行处理，忙时后端只保留最新待分析帧，结果可跳帧；不是云端双工或安全导航。' : 'HTTP 每秒尝试抽帧一次，分析忙时不排队。'} 未使用麦克风；手动看牌始终使用 HTTP。</p>{channel === 'realtime' && <p className="connection-state" role="status" aria-label="实时连接状态">实时连接：{connectionNames[connectionState]}</p>}</fieldset>}
         <fieldset className="source-field"><legend>画面格式</legend><label>输入格式 <select aria-label="画面格式" value={projection} onChange={e => changeProjection(e.target.value as Projection)}><option value="rectilinear">普通固定视角</option><option value="equirectangular">360° 全景（已拼接 2:1）</option></select></label>{projection === 'equirectangular' && <><p className="quiet-note">请使用 Insta360 Studio 导出的全景 MP4。HTTP 通道一次分析前、左、右、后、上、下六个方向；请保持相机朝向固定。原始 INSV 暂不直接播放。</p><label>正前方在全景中的角度：{heading}° <input aria-label="正前方角度" type="range" min="-180" max="180" step="15" value={heading} onChange={e => { invalidate('正前方已调整，请重新开始'); video.current?.pause(); setHeading(Number(e.target.value)); }}/></label><p className="quiet-note">0° 对应画面横向中央，+90° 对应画面右侧四分之三处；以路线前进方向校准。方向不随用户转头自动更新。</p></>}</fieldset>
-        <p className="quiet-note">结合物体类型、方向和粗略远近选择提示，每次最多两项，优先前方并兼顾侧方和上方；后方疑似靠近需连续帧支持。远近仅辅助排序，不提供测距或通行判断。</p>
+        <fieldset className="source-field"><legend>播报策略</legend><label>详细度：<select aria-label="播报详细度" value={speechDetail} onChange={e => setSpeechDetail(e.target.value as SpeechDetailLevel)}><option value="low">低（仅方向，最多3项）</option><option value="medium">中（方向+距离，最多2项）</option><option value="high">高（方向+距离+速度，最多1项）</option></select></label><label>播报阈值：{speechThreshold} 分 <input aria-label="播报阈值" type="range" min="0" max="200" step="5" value={speechThreshold} onChange={e => setSpeechThreshold(Number(e.target.value))}/></label><p className="quiet-note">只有综合分超过阈值才播报。详细度越高，每次播报项数越少；播报项数不等于抽帧频率。速度仅表示画面中的接近趋势，不输出米/秒。</p></fieldset>
+        <p className="quiet-note">结合物体类型、方向、粗略远近和接近趋势选择提示；远近只用于风险排序，不提供精确测距或通行判断。</p>
         <div className="consent"><label><input type="checkbox" checked={consent} onChange={e => { setConsent(e.target.checked); if(!e.target.checked) { invalidate('已停止处理'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); } }}/><span>{health?.provider==='sample' ? '我了解当前为固定样例联调，不能作为真实识别演示。' : '我了解抽帧将发送至百炼云端分析，并同意开始。应用不默认保存图片或视频。'}</span></label></div>
         <div className="actions"><button className="primary" disabled={!permitted} onClick={() => running ? pause() : void start(false)}>{connecting ? <><Camera aria-hidden="true"/>连接摄像头中…</> : running ? <><Pause aria-hidden="true"/>Ⅱ 暂停识别</> : singleOnly ? <><Accessibility aria-hidden="true"/>识别当前环境</> : <><Play aria-hidden="true"/>▶ 开始识别</>}</button><button disabled={!consent || !httpConfigured || connecting || cameraControlBusy || reading || (busy && channel === 'http')} onClick={() => void start(true)}><ScanText aria-hidden="true"/>看牌 · 读取文字</button><button className="stop" onClick={() => { invalidate('已停止，摄像头已释放'); releaseCamera(); if(source==='camera') setReady(false); else video.current?.pause(); }}><Square aria-hidden="true"/>停止并释放输入</button></div>
       </section>
@@ -468,20 +601,40 @@ export default function App() {
           <div className="card-heading"><div><p className="section-index">画面</p><h2>观察窗口</h2></div><span className={`status ${running ? 'on' : ''}`}><i/>{connecting ? '连接中' : busy ? '识别中' : running ? '自动观察中' : '待命'}</span></div>
           <div className={`viewport ${ready ? 'has-video' : ''}`}>
             <video ref={video} className={source === 'camera' && projection === 'rectilinear' ? 'camera-flipped' : undefined} muted playsInline controls={source==='video'} onLoadedData={() => setReady(true)} onError={() => { invalidate('输入不可用'); setReady(false); setError('无法解码视频，请使用 H.264 编码的 MP4 文件。'); }} onSeeking={() => { if(sourceRef.current==='video' && !internalSeek.current) invalidate('视频位置已改变，请重新开始'); }} onPause={() => { if(sourceRef.current==='video' && active.current && !internalRead.current) invalidate('视频已暂停，识别同步暂停'); }} onEnded={() => invalidate('视频已结束')} aria-label={sourceNames[source]} />
+            {result?.events.some(event => event.box || event.original_box || event.predicted_box) && <svg className={`motion-overlay ${source === 'camera' && projection === 'rectilinear' ? 'camera-flipped-overlay' : ''}`} viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-label="识别框">
+              {result.events.filter(event => event.box || event.original_box || event.predicted_box).map((event, i) => {
+                const modelBox = event.original_box ?? event.box;
+                const mirrored = source === 'camera' && projection === 'rectilinear';
+                const labelX = modelBox ? mirrored ? 1000 - modelBox[2] + 8 : modelBox[0] + 8 : 0;
+                return <g key={`${event.label}-${i}`}>
+                  <g transform={mirrored ? 'translate(1000 0) scale(-1 1)' : undefined}>
+                    {modelBox && <rect className={event.original_box ? 'motion-box-original' : 'motion-box-model'} x={modelBox[0]} y={modelBox[1]} width={modelBox[2]-modelBox[0]} height={modelBox[3]-modelBox[1]}/>} 
+                    {event.original_box && event.box && <rect className="motion-box-current" x={event.box[0]} y={event.box[1]} width={event.box[2]-event.box[0]} height={event.box[3]-event.box[1]}/>} 
+                    {event.predicted_box && <rect className="motion-box-predicted" x={event.predicted_box[0]} y={event.predicted_box[1]} width={event.predicted_box[2]-event.predicted_box[0]} height={event.predicted_box[3]-event.predicted_box[1]}/>} 
+                  </g>
+                  {modelBox && <text className="motion-box-label" x={labelX} y={Math.max(22, modelBox[1] - 8)}>{event.text}</text>}
+                </g>;
+              })}
+            </svg>}
             {!ready && <div className="empty-preview"><div className="viewfinder" aria-hidden="true">{source === 'camera' ? <Camera/> : <FileVideo/>}</div><h3>{source==='camera' ? '摄像头尚未开启' : '尚未选择路线视频'}</h3><p>{source==='camera' ? '可先仅本地预览，确认画面后开始识别' : '选择本地 MP4 后开始识别'}</p></div>}
             <span className="source-label">{source==='video' ? 'VIDEO / 回放输入' : 'CAMERA / 实时输入'}</span>
           </div>
           <div className="source-options">{source==='video' ? <label className="file-picker">选择 MP4 视频<input type="file" accept="video/mp4,.mp4" aria-label="选择 MP4 视频" onChange={e => loadVideo(e.target.files?.[0])}/><small>{fileName || '视频仅在本机播放，识别时上传抽帧'}</small></label> : <><label>摄像头<select aria-label="摄像头" value={deviceId} onChange={e => { invalidate('摄像头已切换，请重新开始'); releaseCamera(); setReady(false); setDeviceId(e.target.value); }}><option value="">系统默认摄像头</option>{devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `摄像头 ${i+1}`}</option>)}</select></label><button disabled={connecting} onClick={() => void previewCamera()}>仅本地预览</button><small>{activeCameraLabel ? `当前输入：${activeCameraLabel}` : '支持 Link 2 / USB 摄像头'} · 仅本地预览不会上传画面</small></>}</div>
           {source === 'camera' && <Link2Controls activeLabel={activeCameraLabel} cameraLabels={devices.map(d => d.label)} beforeControl={() => invalidate('相机画面正在调整，识别已暂停。确认画面稳定后重新开始。')} onControlBusyChange={pending => setCameraControlCount(count => count + (pending ? 1 : -1))}/>}
         </section>
-        <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 6 项 · 播报最多 2 项</span></div>
-          <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{directionNames[event.direction]}{event.approaching ? " · 疑似靠近" : ""}{event.proximity && event.proximity !== "unknown" ? ` · 粗估${{near:"较近",mid:"中距",far:"较远"}[event.proximity]}` : ""}</span></div>)}</div>
+        <section className="insight-card" aria-label="识别详情"><div className="card-heading"><div><p className="section-index">结果</p><h2>本帧识别详情</h2></div><span className="tag subtle">最多 6 项 · 当前档位最多 {speechDetail === 'low' ? 3 : speechDetail === 'medium' ? 2 : 1} 项播报</span></div>
+          <div className="event-list">{result?.events.map((event, i) => <div className="event" key={i}><span className={`event-dot ${event.category}`}/><strong>{event.text}</strong><span>{event.direction_predicted && event.original_direction ? `${directionNames[event.original_direction]}→` : ''}{directionNames[event.direction]}{event.approaching ? " · 疑似靠近" : ""}{event.speed_level && event.speed_level !== 'unknown' ? ` · ${event.speed_level === 'fast' ? '快速' : event.speed_level === 'medium' ? '中速' : '缓慢'}接近` : ""}{event.proximity && event.proximity !== "unknown" ? ` · 本地粗估${{near:"较近",mid:"中距",far:"较远"}[event.proximity]}` : ""}{event.motion_compensated ? ` · 连续跟踪${event.motion_samples ?? 0}帧` : ""}</span></div>)}</div>
           {!result?.events.length && <div className="empty-events"><Info aria-hidden="true"/><p>识别后，这里会列出当前画面中可确认的信息。</p></div>}
+          {predictionAudit && <div className={`prediction-audit ${predictionAudit.state}`} role="status" aria-label="预测对播报的影响">
+            <div><span>预测对播报的影响</span><strong>{predictionAudit.title}</strong></div>
+            <p>{predictionAudit.detail}</p>
+            <small>结果延迟 {(predictionAudit.ageMs/1000).toFixed(1)} 秒{predictionAudit.attempted ? ` · 可靠匹配 ${predictionAudit.matched}/${predictionAudit.attempted}` : ''}{result?.events.some(event => event.approaching) ? ' · 连续三帧接近趋势已提升播报优先级' : ''}</small>
+          </div>}
           <div className="metrics"><div><span>识别来源</span><strong>{health?.provider==='sample' ? '固定样例' : reading || channel === 'http' ? 'HTTP 抽帧' : '实时连续帧流'}</strong></div><div><span>端到端耗时</span><strong>{roundtrip ? `${(roundtrip/1000).toFixed(1)} s` : '—'}</strong></div><div><span>播报状态</span><strong>{muted ? '已静音' : voiceName ? '中文语音' : '仅文字'}</strong></div></div>
           <p className="quiet-note">只提示当前画面中可确认的信息。没有提示，不代表前方安全。</p>
         </section>
       </div>
-      <section className="bottom-grid"><div className="voice-card"><div className="utility-icon" aria-hidden="true"><Headphones/></div><div><h2>语音输出</h2><p>{voiceName || '尚未检测到中文语音。请安装系统中文语音后重启浏览器。'}</p>{voiceError && <p role="alert" className="error">{voiceError}</p>}</div><button onClick={voiceTest} disabled={muted || running || busy}><Volume2 aria-hidden="true"/>测试中文语音</button></div><details className="debug"><summary>运行详情 <span>最近 5 次 · 仅本次会话</span></summary><p>服务：{health?.provider ?? '未连接'} · 模型：{currentModel ?? '—'}</p>{history.length===0 ? <p>尚无识别记录。</p> : history.map(r => <div className="debug-row" key={r.frame_id}>#{r.frame_id} · {r.status} · {r.latency_ms} ms · {r.events.length} 个观察</div>)}<p>不记录图片、密钥或 OCR 全文。</p></details></section>
+      <section className="bottom-grid"><div className="voice-card"><div className="utility-icon" aria-hidden="true"><Headphones/></div><div><h2>语音输出</h2><p>{voiceName || '尚未检测到中文语音。请安装系统中文语音后重启浏览器。'}</p>{voiceError && <p role="alert" className="error">{voiceError}</p>}</div><button onClick={voiceTest} disabled={muted || running || busy}><Volume2 aria-hidden="true"/>测试中文语音</button></div><details className="debug"><summary>运行详情 <span>最近 5 次 · 仅本次会话</span></summary><p>服务：{health?.provider ?? '未连接'} · 模型：{currentModel ?? '—'}</p>{history.length===0 ? <p>尚无识别记录。</p> : history.map(r => <div className="debug-row" key={r.frame_id}>#{r.frame_id} · {r.status} · {r.latency_ms} ms · {r.events.length} 个观察{r.timing && <span> · 图像处理 {r.timing.prepare_ms} ms · 模型 {r.timing.model_ms} ms · 规则 {r.timing.rules_ms} ms</span>}</div>)}<p>不记录图片、密钥或 OCR 全文。</p></details></section>
     </main><footer><span>CityLens · 环境理解辅助工具</span><span>不提供测距、通行判断或安全保证</span></footer>
   </div>;
 }

@@ -8,6 +8,44 @@ from .models import AnalyzeInput, SpatialObservation, VisionResult
 from .panorama import angular_span, bearing, direction_from_bearing
 
 
+def calculate_approach_speed(samples):
+    """Return (relative growth rate %/s, speed level) for a tracked target.
+
+    The input is three or more ``(monotonic_seconds, apparent_extent)`` samples
+    from one distance basis.  This is an apparent-size trend, not metres/second.
+    Ambiguous, discontinuous, shrinking, or non-positive samples are unknown.
+    """
+    if len(samples) < 3:
+        return None, 'unknown'
+    points = list(samples)[-3:]
+    if any(not isinstance(point, (tuple, list)) or len(point) != 2 for point in points):
+        return None, 'unknown'
+    try:
+        times = [float(point[0]) for point in points]
+        sizes = [float(point[1]) for point in points]
+    except (TypeError, ValueError):
+        return None, 'unknown'
+    if (any(not math.isfinite(value) for value in (*times, *sizes))
+            or any(value <= 0 for value in sizes)
+            or not (times[0] < times[1] < times[2])
+            or not 1 <= times[-1] - times[0] <= 20):
+        return None, 'unknown'
+    if sizes[1] < sizes[0] * .98 or sizes[2] < sizes[1] * .98:
+        return None, 'unknown'
+    elapsed = times[-1] - times[0]
+    rate = ((sizes[-1] / sizes[0]) ** (1 / elapsed) - 1) * 100
+    if not math.isfinite(rate):
+        return None, 'unknown'
+    rate = round(rate, 3)
+    if rate <= 3:
+        return rate, 'unknown'
+    if rate <= 10:
+        return rate, 'slow'
+    if rate <= 25:
+        return rate, 'medium'
+    return rate, 'fast'
+
+
 @dataclass
 class Track:
     event: SpatialObservation
@@ -76,6 +114,8 @@ class SpatialSessions:
         session.seen, session.frame = now, meta.frame_id
         enriched = []
         for raw in ([] if result.uncertain else result.events):
+            if raw.label == 'bicycle':
+                continue
             event = SpatialObservation(**raw.model_dump())
             if meta.projection == 'equirectangular':
                 angles = bearing(raw)
@@ -83,6 +123,8 @@ class SpatialSessions:
                     continue  # Missing panel provenance must not become a guessed direction.
                 event.yaw_deg, event.pitch_deg = angles
                 event.direction = direction_from_bearing(*angles)
+                if event.label == 'person' and event.view == 'down':
+                    continue  # The nadir face contains the camera carrier in flattened Insta360 exports.
                 if event.label == 'person' and event.pitch_deg < -55:
                     continue  # Nadir bodies are usually the camera carrier; not a route alert.
                 if event.label == 'person' and event.box and event.box[1] >= 700 and event.box[3] >= 980:
@@ -96,7 +138,7 @@ class SpatialSessions:
                 w, h, fov = width, height, settings.camera_hfov_deg
             # Physical sizes for stairs, signs, overhead objects vary too much for this approximation.
             complete_height = event.box and event.box[1] > 5 and event.box[3] < 995
-            if complete_height and event.label in {'bicycle', 'person', 'car', 'motorcycle', 'bollard', 'barrier'}:
+            if complete_height and event.label in {'person', 'car', 'motorcycle', 'bollard', 'barrier'}:
                 estimate = estimate_distance_m(event, w, h, fov)
                 if estimate is not None:
                     event.distance_basis = 'apparent_size'
@@ -137,11 +179,16 @@ class SpatialSessions:
                 extent = scale(event, axis)
                 if extent:
                     track.scales.append((now, extent))
-            rear = event.direction == 'back' or (event.yaw_deg is not None and abs(event.yaw_deg) >= 120)
-            if len(track.scales) == 3 and rear and event.proximity == 'near':
+            event.approach_rate, event.speed_level = calculate_approach_speed(track.scales)
+            # Three well-separated cloud observations can indicate that this
+            # labelled object occupies more of the current view. This is an
+            # apparent approach cue only: a monocular image cannot provide a
+            # metric user trajectory or time-to-collision.
+            route_direction = event.direction in {'left', 'front', 'right', 'back'}
+            if len(track.scales) == 3 and route_direction and event.proximity == 'near':
                 (t0,h0),(t1,h1),(t2,h2) = track.scales
                 event.approaching = (1 <= t2-t0 <= 20 and h1 >= h0*1.08 and h2 >= h1*1.08
-                                     and h2 >= h0*1.25 and event.label in {'person','bicycle','car','motorcycle'})
+                                     and h2 >= h0*1.25 and event.label in {'person','car','motorcycle'})
             track.event, track.seen = event, now
             tracks.append(track)
         session.tracks = tracks[:12]

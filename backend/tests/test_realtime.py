@@ -30,7 +30,7 @@ PRIVATE = 'private-provider-body-or-image-metadata'
 DIRECT_CONNECT = realtime_module.DirectConnect
 RESULT = {
     'uncertain': False,
-    'events': [{'category': 'obstacle', 'label': 'bicycle',
+    'events': [{'category': 'obstacle', 'label': 'car',
                 'direction': 'right', 'text': PRIVATE}],
 }
 RESULT_TEXT = json.dumps(RESULT)
@@ -845,9 +845,9 @@ def test_ws_two_sources_use_in_memory_sanitized_jpegs(monkeypatch, caplog, sourc
                 result = AnalyzeResponse.model_validate(message)
                 assert (result.session_id, result.frame_id) == ('realtime-test', number)
                 assert result.status == 'ok' and result.error_code is None
-                assert result.events[0].text == '自行车'
+                assert result.events[0].text == '车辆'
                 # 同一播报键两帧间隔 1 秒，落在 4 秒去重窗口内，第二帧不再播报
-                assert (result.speech is None) if number == 2 else (result.speech.text == '右侧发现自行车')
+                assert (result.speech is None) if number == 2 else (result.speech.text == '右侧发现车辆')
                 assert result.latency_ms >= 0
                 assert_no_secrets(message)
             disconnect_and_join(client, socket)
@@ -1378,8 +1378,11 @@ def test_http_walk_and_read_remain_available_with_original_model(provider, caplo
             assert response.headers['cache-control'] == 'no-store'
             result = AnalyzeResponse.model_validate(response.json())
             assert result.status == 'ok'
-            assert result.events[0].label == ('bicycle' if mode == 'walk' else 'sign')
-            assert result.speech is not None
+            if provider == 'sample' and mode == 'walk':
+                assert result.events == []
+            else:
+                assert result.events[0].label == ('car' if mode == 'walk' else 'sign')
+            assert (result.speech is None) if provider == 'sample' and mode == 'walk' else (result.speech is not None)
             assert_no_secrets(response.text, caplog.text, health)
         assert len(requests) == (2 if provider == 'realtime' else 0)
         assert_released(client)

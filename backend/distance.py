@@ -11,7 +11,6 @@ TYPICAL_HEIGHT_M = {
     'motorcycle': 1.1,
     'step': 0.15,
     'stairs': 1.2,
-    'bicycle': 1.0,
     'barrier': 1.5,
     'bollard': 0.9,
     'obstacle': 0.8,

@@ -12,7 +12,6 @@ LABELS = {
     'motorcycle': ('obstacle', '摩托车'),
     'overhead': ('obstacle', '悬空障碍'),
     'canopy': ('facility', '顶棚'),
-    'bicycle': ('obstacle', '自行车'),
     'barrier': ('obstacle', '围挡'),
     'bollard': ('obstacle', '路障'),
     'step': ('obstacle', '台阶'),
@@ -100,6 +99,8 @@ class AnalyzeInput(StrictModel):
     source: Source
     projection: Projection = 'rectilinear'
     heading_deg: int = Field(default=0, ge=-180, le=180)
+    speech_threshold: float | None = Field(default=None, ge=0, le=200)
+    speech_detail_level: Literal['low', 'medium', 'high'] | None = None
 
 
 class RealtimeFrame(AnalyzeInput):
@@ -121,6 +122,14 @@ class SpatialObservation(Observation):
     yaw_deg: float | None = None
     pitch_deg: float | None = None
     distance_basis: Literal['apparent_size', 'apparent_width', 'unknown'] = 'unknown'
+    approach_rate: float | None = None
+    speed_level: Literal['unknown', 'slow', 'medium', 'fast'] = 'unknown'
+
+
+class LatencyBreakdown(StrictModel):
+    prepare_ms: int = Field(ge=0)
+    model_ms: int = Field(ge=0)
+    rules_ms: int = Field(ge=0)
 
 
 class AnalyzeResponse(StrictModel):
@@ -130,6 +139,7 @@ class AnalyzeResponse(StrictModel):
     events: list[SpatialObservation] = Field(default_factory=list)
     speech: Speech | None = None
     latency_ms: int = 0
+    timing: LatencyBreakdown | None = None
     error_code: str | None = None
     message: str | None = None
 

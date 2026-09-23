@@ -7,7 +7,15 @@ Push-Location $projectRoot
 try {
     if (!(Get-Command py -ErrorAction SilentlyContinue)) { throw 'Install Python 3.13 or 3.14 (including the py launcher) first.' }
     if (!(Get-Command pnpm -ErrorAction SilentlyContinue)) { throw 'Install Node.js 24 and pnpm 11.19.0 first.' }
-    if (!(Test-Path '.venv/Scripts/python.exe')) {
+    $venvPython = Join-Path $projectRoot '.venv/Scripts/python.exe'
+    $venvReady = Test-Path -LiteralPath $venvPython
+    if ($venvReady) {
+        try { & $venvPython --version *> $null; $venvReady = $LASTEXITCODE -eq 0 } catch { $venvReady = $false }
+    }
+    if (!$venvReady -and (Test-Path '.venv')) {
+        throw 'The existing .venv is invalid or was created on another computer. Remove only this project .venv folder, then rerun .\scripts\setup.ps1.'
+    }
+    if (!$venvReady) {
         & py -m venv .venv
         if ($LASTEXITCODE -ne 0) { throw 'Could not create Python virtual environment.' }
     }

@@ -20,7 +20,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.websockets import WebSocketState
 
-from .models import AnalyzeInput, AnalyzeResponse, RealtimeFrame
+from .models import AnalyzeInput, AnalyzeResponse, LatencyBreakdown, RealtimeFrame
 from .link2 import camera_router
 from .realtime import MAX_FRAME_MESSAGE, realtime_session
 from .panorama import prepare_panorama
@@ -69,6 +69,17 @@ def float_env(name, fallback):
         return fallback
 
 
+def detail_env(name, fallback='medium'):
+    value = os.getenv(name, fallback).strip().lower()
+    return value if value in {'low', 'medium', 'high'} else fallback
+
+
+def request_speech_options(meta, config):
+    threshold = config.speech_score_threshold if meta.speech_threshold is None else meta.speech_threshold
+    detail = config.speech_detail_level if meta.speech_detail_level is None else meta.speech_detail_level
+    return threshold, detail
+
+
 def load_settings():
     load_dotenv(ROOT / '.env', override=False)
     provider = os.getenv('CITYLENS_PROVIDER', 'live')
@@ -80,12 +91,14 @@ def load_settings():
                     read_model=os.getenv('DASHSCOPE_READ_MODEL', '').strip(),
                     realtime_model=os.getenv('DASHSCOPE_REALTIME_MODEL', Settings.realtime_model).strip(),
                     realtime_url=os.getenv('DASHSCOPE_REALTIME_URL', '').strip(),
-                    sample_scene=os.getenv('CITYLENS_SAMPLE_SCENE', 'bicycle'),
+                    sample_scene=os.getenv('CITYLENS_SAMPLE_SCENE', 'empty'),
                     max_distance_m=float_env('CITYLENS_MAX_DISTANCE_M', 5.0),
                     camera_hfov_deg=float_env('CITYLENS_CAMERA_HFOV_DEG', 75.0),
                     speech_repeat_seconds=float_env('CITYLENS_SPEECH_REPEAT_SECONDS', 4.0),
                     min_confidence=float_env('CITYLENS_MIN_CONFIDENCE', 0.5),
-                    continuous_repeat_seconds=float_env('CITYLENS_CONTINUOUS_REPEAT_SECONDS', 12.0))
+                    continuous_repeat_seconds=float_env('CITYLENS_CONTINUOUS_REPEAT_SECONDS', 12.0),
+                    speech_score_threshold=float_env('CITYLENS_SPEECH_SCORE_THRESHOLD', 70.0),
+                    speech_detail_level=detail_env('CITYLENS_SPEECH_DETAIL_LEVEL'))
 
 
 def clean_jpeg(data: bytes, max_side=2048, quality=85) -> bytes:
@@ -114,7 +127,8 @@ def create_app(settings: Settings | None = None, transport=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        async with httpx.AsyncClient(timeout=8, transport=transport, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=8, transport=transport, follow_redirects=False,
+                                     limits=httpx.Limits(max_connections=4, max_keepalive_connections=2, keepalive_expiry=60)) as client:
             app.state.client = client
             app.state.lock = asyncio.Lock()
             app.state.realtime_lock = asyncio.Lock()
@@ -131,7 +145,11 @@ def create_app(settings: Settings | None = None, transport=None):
         return {'status': 'ok', 'provider': config.provider, 'configured': config.configured,
                 'model': 'fixed-sample' if config.provider == 'sample' else config.realtime_model if config.provider == 'realtime' else config.model,
                 'http_model': config.model, 'http_configured': config.http_configured,
+                'read_model': config.read_model or config.model,
                 'realtime_model': config.realtime_model, 'realtime_configured': config.realtime_configured,
+                'camera_hfov_deg': config.camera_hfov_deg,
+                'speech_score_threshold': config.speech_score_threshold,
+                'speech_detail_level': config.speech_detail_level,
                 'sample_scene': config.sample_scene if config.provider == 'sample' else None,
                 'version': '0.1.0'}
 
@@ -182,7 +200,11 @@ def create_app(settings: Settings | None = None, transport=None):
                             image = clean_jpeg(base64.b64decode(frame.image, validate=True), max_side=960, quality=65)
                         except (binascii.Error, ValueError):
                             raise VisionError('invalid_input') from None
-                        meta = AnalyzeInput(session_id=frame.session_id, frame_id=frame.frame_id, mode=frame.mode, source=frame.source)
+                        meta = AnalyzeInput(session_id=frame.session_id, frame_id=frame.frame_id,
+                                            mode=frame.mode, source=frame.source,
+                                            projection=frame.projection, heading_deg=frame.heading_deg,
+                                            speech_threshold=frame.speech_threshold,
+                                            speech_detail_level=frame.speech_detail_level)
                         if pending_frame.full():
                             pending_frame.get_nowait()
                         pending_frame.put_nowait((image, meta, now))
@@ -212,8 +234,10 @@ def create_app(settings: Settings | None = None, transport=None):
                                 generating = False
                                 del image
                             spatial, recent = app.state.spatial.process(frame, result, img_w, img_h, config, received_at)
+                            threshold, detail = request_speech_options(frame, config)
                             response = summarize(frame, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial,
-                                                 min_confidence=config.min_confidence, continuous_repeat_seconds=config.continuous_repeat_seconds)
+                                                 min_confidence=config.min_confidence, continuous_repeat_seconds=config.continuous_repeat_seconds,
+                                                 score_threshold=threshold, detail_level=detail)
                             response.latency_ms = int((time.monotonic() - received_at) * 1000)
                             await socket.send_json({'type': 'result', **response.model_dump()})
                             logger.info('realtime status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
@@ -263,20 +287,24 @@ def create_app(settings: Settings | None = None, transport=None):
                 yield chunk
         form = None
         try:
-            parser = MemoryParser(request.headers, bounded_stream(), max_files=1, max_fields=7, max_part_size=1024)
+            parser = MemoryParser(request.headers, bounded_stream(), max_files=1, max_fields=9, max_part_size=1024)
             form = await parser.parse()
             required = {'image', 'mode', 'source', 'session_id', 'frame_id'}
-            allowed = required | {'projection', 'heading_deg'}
+            allowed = required | {'projection', 'heading_deg', 'speech_threshold', 'speech_detail_level'}
             if not required <= set(form.keys()) <= allowed or len(form.multi_items()) != len(form.keys()):
                 raise VisionError('invalid_input')
-            meta = AnalyzeInput.model_validate({k: form[k] for k in allowed - {'image'} if k in form})
+            values = {k: form[k] for k in allowed - {'image'} if k in form}
+            # Older clients and test fixtures may serialize optional settings as
+            # the literal string "None"; treat that as omitted for compatibility.
+            values = {k: v for k, v in values.items() if v != 'None'}
+            meta = AnalyzeInput.model_validate(values)
             upload = form['image']
             if not isinstance(upload, UploadFile) or upload.content_type != 'image/jpeg':
                 raise VisionError('invalid_input')
             data = await upload.read(MAX_IMAGE + 1)
             if len(data) > MAX_IMAGE:
                 return fail('image_too_large', 413)
-            image = clean_jpeg(data)
+            image = await asyncio.to_thread(clean_jpeg, data)
         except MultiPartException:
             return fail('image_too_large' if total > MAX_BODY else 'invalid_input', 413 if total > MAX_BODY else 422)
         except (ValidationError, VisionError, ValueError, KeyError):
@@ -290,14 +318,21 @@ def create_app(settings: Settings | None = None, transport=None):
             async with app.state.lock:
                 if meta.projection == 'equirectangular':
                     prepared = await asyncio.to_thread(prepare_panorama, image, meta)
-                    result = await observe(prepared, meta.mode, config, app.state.client, panorama=True)
                 else:
-                    result = await observe(image, meta.mode, config, app.state.client)
+                    prepared = image
+                prepared_at = time.monotonic()
+                result = await observe(prepared, meta.mode, config, app.state.client,
+                                       panorama=meta.projection == 'equirectangular')
+                observed_at = time.monotonic()
             img_w, img_h = jpeg_dimensions(image)
             spatial, recent = app.state.spatial.process(meta, result, img_w, img_h, config, started)
+            threshold, detail = request_speech_options(meta, config)
             response = summarize(meta, result, recent, repeat_seconds=config.speech_repeat_seconds, spatial=spatial,
-                                 min_confidence=config.min_confidence, continuous_repeat_seconds=config.continuous_repeat_seconds)
+                                 min_confidence=config.min_confidence, continuous_repeat_seconds=config.continuous_repeat_seconds,
+                                 score_threshold=threshold, detail_level=detail)
             response.latency_ms = int((time.monotonic()-started)*1000)
+            response.timing = LatencyBreakdown(prepare_ms=int((prepared_at-started)*1000),
+                model_ms=int((observed_at-prepared_at)*1000), rules_ms=int((time.monotonic()-observed_at)*1000))
             logger.info('analyze status=%s events=%s latency_ms=%s', response.status, len(response.events), response.latency_ms)
             return JSONResponse(response.model_dump(), headers={'Cache-Control':'no-store'})
         except VisionError as error:

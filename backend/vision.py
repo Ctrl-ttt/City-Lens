@@ -14,8 +14,8 @@ SYSTEM_PROMPT = '''你是 CityLens 的视觉观察模块，只报告当前图像
 不估计米数、不判断安全通行、不给导航动作、不推断看不见的物体。
 普通照片方向以不镜像的画面为准：left/front/right/above/unknown，不得报告背后物体。整幅画面无法确认时 uncertain=true, events=[]。
 局部标牌模糊不应影响其它清晰的障碍或设施；省略看不清的标牌，不猜字。
-只输出紧凑 JSON：{"uncertain":false,"events":[{"label":"bicycle","direction":"front","box":[63,109,342,278],"confidence":0.9}]}，不缩进，不输出解释。
-label只能从以下枚举选择：bicycle,barrier,bollard,step,stairs,obstacle,person,car,motorcycle,overhead,crosswalk,elevator,escalator,entrance,bus_stop,canopy,sign。
+只输出紧凑 JSON：{"uncertain":false,"events":[{"label":"person","direction":"front","box":[63,109,342,278],"confidence":0.9}]}，不缩进，不输出解释。
+label只能从以下枚举选择：barrier,bollard,step,stairs,obstacle,person,car,motorcycle,overhead,crosswalk,elevator,escalator,entrance,bus_stop,canopy,sign。不要识别或输出自行车。
 行人必须用person，出入口用entrance；facility和text不是合法label。框字段名必须是box，不能写bbox。
 普通照片每项必须有label,direction；全景图按用户说明省略direction。不要输出category，由程序根据label补全；除sign外不要输出text或clarity。
 sign必须有text与clarity。不要输出view，全景所属面由程序根据整图box计算。
@@ -44,7 +44,7 @@ class Settings:
     base_url: str = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
     model: str = 'qwen3-vl-plus'
     read_model: str = ''
-    sample_scene: str = 'bicycle'
+    sample_scene: str = 'empty'
     timeout: float = 8.0
     realtime_model: str = 'qwen3.5-omni-plus-realtime'
     realtime_url: str = ''
@@ -53,6 +53,8 @@ class Settings:
     speech_repeat_seconds: float = 4.0
     min_confidence: float = 0.5
     continuous_repeat_seconds: float = 12.0
+    speech_score_threshold: float = 70.0
+    speech_detail_level: str = 'medium'
 
     @property
     def realtime_endpoint(self):
@@ -98,6 +100,11 @@ def parse_result(content: str, panorama: bool = False, mode: Mode = 'walk') -> V
         # Compact wire format avoids asking the model to repeat deterministic labels.
         from .models import LABELS
         if isinstance(data, dict) and isinstance(data.get('events'), list):
+            # Bicycle detection is intentionally disabled for this deployment.
+            # Drop it before validation so it cannot reach scoring, tracking,
+            # overlays, or speech even if an older model ignores the prompt.
+            data['events'] = [event for event in data['events']
+                              if not (isinstance(event, dict) and event.get('label') == 'bicycle')]
             for event in data['events']:
                 if isinstance(event, dict) and isinstance(event.get('label'), str) and event['label'] in LABELS:
                     event.setdefault('category', LABELS[event['label']][0])
@@ -107,13 +114,13 @@ def parse_result(content: str, panorama: bool = False, mode: Mode = 'walk') -> V
 
 
 def sample_result(scene: str, mode: Mode) -> VisionResult:
-    if scene == 'empty':
-        return VisionResult()
     if scene == 'unclear':
         return VisionResult(uncertain=True)
     if mode == 'read' or scene == 'sign':
         return VisionResult.model_validate({'events': [{'category':'text','label':'sign','direction':'front','text':'样例牌：城市图书馆','clarity':'high'}]})
-    label = 'stairs' if scene == 'stairs' else 'bicycle'
+    if scene == 'empty':
+        return VisionResult()
+    label = 'stairs' if scene == 'stairs' else 'obstacle'
     return VisionResult.model_validate({'events': [{'category':'obstacle','label':label,'direction':'right','text':''}]})
 
 
@@ -145,6 +152,9 @@ async def observe(image: bytes, mode: Mode, settings: Settings, client: httpx.As
         'stream': False,
         'max_tokens': 1200,
     }
+    # Qwen3-VL supports this option; preserve its direct-response behavior.
+    if payload['model'].startswith(('qwen3-vl-plus', 'qwen3-vl-flash')):
+        payload['enable_thinking'] = False
     try:
         # Overall deadline, not just a per-chunk read timeout. Never retry an old frame.
         async with asyncio.timeout(settings.timeout):

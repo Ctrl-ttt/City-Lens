@@ -6,11 +6,11 @@ declare global {
 }
 const health: Health = { status: 'ok', provider: 'realtime', model: 'realtime-test', configured: true, sample_scene: null, http_model: 'http-test', http_configured: true, realtime_model: 'realtime-test', realtime_configured: true };
 type Connection = { route: WebSocketRoute; frames: RealtimeFrame[]; closed: boolean };
-function respond(connection: Connection, frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text = '右侧发现自行车') {
+function respond(connection: Connection, frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text = '右侧发现楼梯') {
   connection.route.send(JSON.stringify({ type: 'result', ...analysis(frame, text) }));
 }
 function analysis(frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text: string) {
-  return { session_id: frame.session_id, frame_id: frame.frame_id, status: 'ok', events: [{ category: 'obstacle', label: 'bicycle', direction: 'right', text }], speech: { key: text, priority: 'normal', text }, latency_ms: 100 };
+  return { session_id: frame.session_id, frame_id: frame.frame_id, status: 'ok', events: [{ category: 'obstacle', label: 'stairs', direction: 'right', text }], speech: { key: text, priority: 'normal', text }, latency_ms: 100 };
 }
 function signAnalysis(frame: Pick<RealtimeFrame, 'session_id' | 'frame_id'>, text = '测试路', direction: Analysis['events'][number]['direction'] = 'front', clarity: 'high' | 'medium' = 'high'): Analysis {
   // Server fixtures use already-normalized text; direction/clarity never enter the speech key.
@@ -131,7 +131,7 @@ for (const source of ['camera', 'video'] as const) {
     await page.getByRole('checkbox', { name: /我了解抽帧/ }).check();
     await page.getByRole('button', { name: '识别当前环境', exact: true }).click();
     await expect.poll(() => connections[0]?.frames.length).toBe(1);
-    await expect(caption(page)).toHaveText('右侧发现自行车');
+    await expect(caption(page)).toHaveText('右侧发现楼梯');
     await expect(page.locator('video')).toHaveCSS('transform', source === 'camera' ? 'matrix(-1, 0, 0, 1, 0, 0)' : 'none');
 
     const colors = (image: Buffer) => page.evaluate(async bytes => {
@@ -291,9 +291,9 @@ test('default channel, consent, eight-second ready gate, real canvas/TTS, pause 
   expect(connections[0].frames).toHaveLength(0);
   expect(await page.evaluate(() => window.__captures)).toBe(0);
   connections[0].route.send('{"type":"ready"}');
-  await expect(caption(page)).toHaveText('右侧发现自行车');
+  await expect(caption(page)).toHaveText('右侧发现楼梯');
   await expect(state(page)).toHaveText('实时连接：已连接');
-  expect(await page.evaluate(() => window.__spoken)).toEqual(['右侧发现自行车']);
+  expect(await page.evaluate(() => window.__spoken)).toEqual(['右侧发现楼梯']);
   const frame = connections[0].frames[0];
   expect(Object.keys(frame).sort()).toEqual(['frame_id', 'image', 'mode', 'session_id', 'source', 'type']);
   expect(frame).toMatchObject({ type: 'frame', mode: 'walk', source: 'camera', frame_id: 1 });
@@ -319,7 +319,7 @@ test('default channel, consent, eight-second ready gate, real canvas/TTS, pause 
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
   await expect.poll(() => connections.length).toBe(2);
   connections[1].route.send('{"type":"ready"}');
-  await expect(caption(page)).toHaveText('右侧发现自行车');
+  await expect(caption(page)).toHaveText('右侧发现楼梯');
   expect(connections[1].frames[0].session_id).not.toBe(frame.session_id);
   expect(errors).toEqual([]);
 });
@@ -329,7 +329,7 @@ test('live default allows realtime and switching channels stops without automati
   await expect(page.getByRole('button', { name: 'HTTP 抽帧', exact: true })).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: '实时连接', exact: true }).click();
   await consentAndStart(page);
-  await expect(caption(page)).toHaveText('右侧发现自行车');
+  await expect(caption(page)).toHaveText('右侧发现楼梯');
   await page.getByRole('button', { name: 'HTTP 抽帧', exact: true }).click();
   await expect(caption(page)).toHaveText('识别通道已切换，请重新开始');
   await expect.poll(() => connections[0].closed).toBe(true);
@@ -347,7 +347,7 @@ test('realtime capability is independent of an unconfigured HTTP default', async
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeDisabled();
   await page.getByRole('button', { name: '实时连接', exact: true }).click();
   await page.getByRole('button', { name: '▶ 开始识别' }).click();
-  await expect(caption(page)).toHaveText('右侧发现自行车');
+  await expect(caption(page)).toHaveText('右侧发现楼梯');
   await expect(page.getByRole('button', { name: '看牌 · 读取文字' })).toBeDisabled();
 });
 
@@ -533,7 +533,7 @@ test('single-frame keypress sends once while awaiting analysis and closes after 
   expect(connections[0].frames).toHaveLength(1);
   expect(await page.evaluate(() => window.__captures)).toBe(1);
   respond(connections[0], connections[0].frames[0]);
-  await expect(caption(page)).toHaveText('右侧发现自行车');
+  await expect(caption(page)).toHaveText('右侧发现楼梯');
   await expect.poll(() => connections[0].closed).toBe(true);
   await expect(state(page)).toHaveText('实时连接：已断开');
   await page.clock.runFor(10000);
@@ -549,7 +549,7 @@ test('disconnect clears speech/results and recovery captures a new frame, with a
   await expect.poll(() => connections[0].frames.length).toBe(1);
   const old = connections[0].frames[0];
   respond(connections[0], old);
-  await expect(caption(page)).toHaveText('右侧发现自行车');
+  await expect(caption(page)).toHaveText('右侧发现楼梯');
   const cancels = await page.evaluate(() => window.__cancelled);
   await page.clock.install();
   for (const [index, delay] of [1000, 2000, 4000].entries()) {
@@ -568,7 +568,7 @@ test('disconnect clears speech/results and recovery captures a new frame, with a
   await expect(page.getByRole('alert')).toContainText('HTTP 抽帧');
   await page.clock.runFor(30000);
   expect(connections).toHaveLength(4);
-  expect(await page.evaluate(() => window.__spoken)).toEqual(['右侧发现自行车']);
+  expect(await page.evaluate(() => window.__spoken)).toEqual(['右侧发现楼梯']);
   expect(await page.evaluate(() => window.__cancelled)).toBeGreaterThan(cancels);
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeVisible();
 });
@@ -636,7 +636,7 @@ test('terminal errors suggest HTTP without retrying or falling back to sample', 
 });
 
 test('sample provider prohibits realtime even when realtime credentials are configured', async ({ page }) => {
-  const { connections, http } = await setup(page, { health: { provider: 'sample', sample_scene: 'bicycle', realtime_configured: true } });
+  const { connections, http } = await setup(page, { health: { provider: 'sample', sample_scene: 'stairs', realtime_configured: true } });
   await expect(page.getByRole('button', { name: '实时连接', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '▶ 开始识别' })).toBeDisabled();
   await page.getByRole('checkbox', { name: /我了解当前/ }).check();

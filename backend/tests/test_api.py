@@ -28,20 +28,21 @@ def test_sample_contract_and_health():
         health = client.get('/api/health').json()
         assert health['provider'] == 'sample'
         assert health['model'] == 'fixed-sample'
+        assert health['camera_hfov_deg'] == 75.0
         response = analyze(client)
         assert response.status_code == 200
         assert response.headers['cache-control'] == 'no-store'
         result = response.json()
         assert (result['session_id'], result['frame_id']) == ('test-session', 1)
-        assert result['speech']['text'] == '右侧发现自行车'
-        assert result['speech']['priority'] == 'high'
-        assert analyze(client, 'read').json()['speech']['text'].startswith('标牌文字：样例牌')
+        assert result['speech'] is None
+        assert result['events'] == []
+        assert analyze(client, 'read').json()['speech'] is not None
 
 
 @pytest.mark.parametrize('scene,mode,status,speech', [
     ('empty', 'walk', 'ok', None),
     ('unclear', 'walk', 'uncertain', None),
-    ('empty', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
+    ('empty', 'read', 'ok', '标牌文字：样例牌：城市图书馆'),
     ('unclear', 'read', 'uncertain', '文字看不清，请调整拍摄角度'),
 ])
 def test_empty_and_unclear(scene, mode, status, speech):
@@ -75,10 +76,10 @@ def test_live_adapter_sends_image_and_uses_validated_rules():
         assert request.url.path.endswith('/chat/completions')
         payload = json.loads(request.content)
         assert payload['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/jpeg;base64,')
-        content = {'events': [{'category': 'obstacle', 'label': 'bicycle', 'direction': 'left', 'text': '现在可以过马路'}]}
+        content = {'events': [{'category': 'obstacle', 'label': 'obstacle', 'direction': 'front', 'text': '现在可以过马路'}]}
         return httpx.Response(200, json={'choices': [{'message': {'content': json.dumps(content)}}]})
     with TestClient(create_app(Settings(api_key='test-only'), httpx.MockTransport(handler))) as client:
-        assert analyze(client).json()['speech']['text'] == '左侧发现自行车'
+        assert analyze(client).json()['speech']['text'] == '前方发现障碍物'
 
 
 @pytest.mark.parametrize('mode', ['walk', 'read'])

@@ -43,7 +43,7 @@ test('stitched panorama reaches actual local projection API and heading starts a
     };
   });
   await page.getByRole('button', { name: '识别当前环境', exact: true }).click();
-  await expect(page.locator('.live-caption')).toHaveText('前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('前方发现楼梯');
   const form = await page.evaluate(() => (window as unknown as { panoramaFields: Record<string,string>[] }).panoramaFields[0]);
   expect(form.projection).toBe('equirectangular'); expect(form.heading_deg).toBe('0');
   await expect(page.locator('video')).toHaveCSS('transform', 'none');
@@ -51,7 +51,7 @@ test('stitched panorama reaches actual local projection API and heading starts a
   for (let i=0; i<6; i++) await page.getByLabel('正前方角度').press('ArrowRight');
   await expect(page.locator('.event-list')).toBeEmpty();
   await page.getByRole('button', { name: '识别当前环境', exact: true }).click();
-  await expect(page.locator('.live-caption')).toHaveText('前方发现自行车');
+  await expect(page.locator('.live-caption')).toHaveText('前方发现楼梯');
   const next = await page.evaluate(() => (window as unknown as { panoramaFields: Record<string,string>[] }).panoramaFields[1]);
   expect(next.heading_deg).toBe('90'); expect(next.session_id).not.toBe(form.session_id);
   await page.screenshot({ path: '../work/panorama-check/panorama-ui.png', fullPage: true });

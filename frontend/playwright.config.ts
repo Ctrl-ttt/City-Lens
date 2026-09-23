@@ -30,7 +30,7 @@ export default defineConfig({
     command: `"${python}" -m uvicorn backend.app:app --host 127.0.0.1 --port 8000`,
     cwd: root,
     url: 'http://localhost:8000/api/health',
-    env: { CITYLENS_PROVIDER: 'sample', CITYLENS_SAMPLE_SCENE: 'bicycle' },
+    env: { CITYLENS_PROVIDER: 'sample', CITYLENS_SAMPLE_SCENE: 'stairs' },
     reuseExistingServer: false,
     timeout: 30000,
   },
